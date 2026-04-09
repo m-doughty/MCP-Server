@@ -46,6 +46,58 @@ method prompt(Str:D $name, Str :$description, :@arguments, :&handler!) {
 	%!prompts{$name} = MCP::Server::Prompt.new(:$name, :$description, :@arguments, :&handler);
 }
 
+# === LLM tool bridge ===
+
+method tools-for-llm(--> List) {
+	%!tools.values.map(-> $tool {
+		{
+			type => 'function',
+			function => {
+				name => $tool.name,
+				|($tool.description.defined ?? (description => $tool.description) !! ()),
+				parameters => $tool.input-schema,
+			},
+		}
+	}).list;
+}
+
+method execute-tool-calls(@tool-calls --> List) {
+	@tool-calls.map(-> %tc {
+		my $fn-name = %tc<function><name>;
+		my $args-json = %tc<function><arguments> // '{}';
+		my $call-id = %tc<id> // '';
+
+		my %arguments;
+		try {
+			%arguments = from-json($args-json);
+			CATCH { default { } }
+		}
+
+		my $result;
+		my $is-error = False;
+		if %!tools{$fn-name}:exists {
+			try {
+				$result = %!tools{$fn-name}.call(%arguments);
+				CATCH {
+					default {
+						$result = .message;
+						$is-error = True;
+					}
+				}
+			}
+		} else {
+			$result = "Unknown tool: '$fn-name'";
+			$is-error = True;
+		}
+
+		{
+			role => 'tool',
+			tool_call_id => $call-id,
+			content => ~($result // ''),
+		};
+	}).list;
+}
+
 # === Run loop ===
 
 method run(MCP::Server::Transport :$transport) {

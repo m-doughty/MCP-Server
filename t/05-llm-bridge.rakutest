@@ -1,0 +1,92 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+
+plan 6;
+
+my $server = MCP::Server.new(:name<test>);
+
+$server.tool: 'get_weather',
+	description => 'Get weather for a location',
+	params => {
+		location => { type => 'string', description => 'City name', required => True },
+	},
+	handler => -> :%args { "Sunny, 22C in {%args<location>}" };
+
+$server.tool: 'calculate',
+	description => 'Evaluate a math expression',
+	params => {
+		expression => { type => 'string', description => 'Math expression', required => True },
+	},
+	handler => -> :%args { "42" };
+
+# === tools-for-llm ===
+
+subtest 'tools-for-llm returns OpenAI format' => {
+	plan 4;
+	my @tools = $server.tools-for-llm;
+	is @tools.elems, 2, 'Two tools';
+	is @tools[0]<type>, 'function', 'Type is function';
+	ok @tools.first(*<function><name> eq 'get_weather').defined, 'get_weather present';
+	ok @tools.first(*<function><name> eq 'calculate').defined, 'calculate present';
+};
+
+subtest 'tools-for-llm schema is correct' => {
+	plan 3;
+	my @tools = $server.tools-for-llm;
+	my %weather = @tools.first(*<function><name> eq 'get_weather');
+	is %weather<function><description>, 'Get weather for a location', 'Description';
+	is %weather<function><parameters><properties><location><type>, 'string', 'Param type';
+	ok %weather<function><parameters><required>.first(* eq 'location').defined, 'Required param';
+};
+
+# === execute-tool-calls ===
+
+subtest 'Execute single tool call' => {
+	plan 2;
+	my @calls = [{
+		id => 'call_1',
+		type => 'function',
+		function => { name => 'get_weather', arguments => '{"location": "London"}' },
+	},];
+	my @results = $server.execute-tool-calls(@calls);
+	is @results.elems, 1, 'One result';
+	is @results[0]<content>, 'Sunny, 22C in London', 'Correct result';
+};
+
+subtest 'Execute returns tool message format' => {
+	plan 2;
+	my @calls = [{
+		id => 'call_2',
+		type => 'function',
+		function => { name => 'calculate', arguments => '{"expression": "6*7"}' },
+	},];
+	my @results = $server.execute-tool-calls(@calls);
+	is @results[0]<role>, 'tool', 'Role is tool';
+	is @results[0]<tool_call_id>, 'call_2', 'Tool call ID preserved';
+};
+
+subtest 'Execute multiple tool calls' => {
+	plan 2;
+	my @calls = [
+		{ id => 'c1', type => 'function', function => { name => 'get_weather', arguments => '{"location": "Paris"}' } },
+		{ id => 'c2', type => 'function', function => { name => 'calculate', arguments => '{"expression": "1+1"}' } },
+	];
+	my @results = $server.execute-tool-calls(@calls);
+	is @results.elems, 2, 'Two results';
+	ok @results[0]<content>.contains('Paris'), 'First result correct';
+};
+
+subtest 'Execute unknown tool returns error' => {
+	plan 1;
+	my @calls = [{
+		id => 'c3',
+		type => 'function',
+		function => { name => 'nonexistent', arguments => '{}' },
+	},];
+	my @results = $server.execute-tool-calls(@calls);
+	ok @results[0]<content>.contains('Unknown tool'), 'Error for unknown tool';
+};
+
+done-testing;

@@ -62,6 +62,65 @@ Tool handlers receive `:%args` and return:
 
   * On exception — returned as `isError: true` content
 
+Tool Groups
+-----------
+
+Group related tools under a common prefix using `/` as separator:
+
+```raku
+$server.tool-group: 'file', -> $g {
+    $g.tool: 'read',
+        description => 'Read a file',
+        params => { path => { type => 'string', required => True } },
+        handler => -> :%args { %args<path>.IO.slurp };
+
+    $g.tool: 'list',
+        description => 'List a directory',
+        params => { path => { type => 'string', required => True } },
+        handler => -> :%args { %args<path>.IO.dir.join("\n") };
+};
+# Registers as: file/read, file/list
+```
+
+LLM Tool Bridge
+---------------
+
+Tools registered with MCP::Server can be used with any OpenAI-compatible LLM API. Define tools once, use them both as MCP tools (for Claude Code) and as function-calling tools (for LLM API calls).
+
+```raku
+use MCP::Server;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+# Define tools
+my $server = MCP::Server.new(:name<my-tools>);
+
+$server.tool: 'get_weather',
+    description => 'Get weather for a location',
+    params => { location => { type => 'string', required => True } },
+    handler => -> :%args {
+        my $proc = run 'curl', '-s', "https://wttr.in/{%args<location>}?format=3", :out;
+        $proc.out.slurp(:close).trim;
+    };
+
+# Convert to OpenAI format and send to LLM
+my @tools = $server.tools-for-llm;
+my $backend = LLM::Chat::Backend::OpenAICommon.new(...);
+my @messages = (Message.new(:role<user>, :content<What is the weather in London?>),);
+
+my $resp = $backend.chat-completion(@messages, :@tools);
+
+# If LLM wants to call a tool, execute it
+if $resp.has-tool-calls {
+    my @results = $server.execute-tool-calls($resp.tool-calls);
+    # @results are {role=>"tool", tool_call_id=>"...", content=>"..."}
+    # Append to messages and call LLM again for final answer
+}
+```
+
+`tools-for-llm` converts registered tools to the OpenAI function-calling format. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back.
+
 Resources
 ---------
 
@@ -96,7 +155,7 @@ Examples
 
   * `examples/weather-server.raku` — Weather via wttr.in
 
-  * `examples/file-server.raku` — File system tools
+  * `examples/file-server.raku` — File system tools using tool groups
 
   * `examples/strawberry-server.raku` — The tool LLMs wish they had
 
