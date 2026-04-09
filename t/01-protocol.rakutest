@@ -1,0 +1,56 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server::Protocol;
+
+plan 7;
+
+subtest 'Parse valid message' => {
+	plan 3;
+	my %msg = parse-message('{"jsonrpc":"2.0","id":1,"method":"ping"}');
+	is %msg<jsonrpc>, '2.0', 'jsonrpc version';
+	is %msg<id>, 1, 'id';
+	is %msg<method>, 'ping', 'method';
+};
+
+subtest 'Parse invalid JSON' => {
+	plan 1;
+	my %msg = parse-message('not json');
+	ok %msg<error>:exists, 'Returns error for invalid JSON';
+};
+
+subtest 'Parse missing jsonrpc' => {
+	plan 1;
+	my %msg = parse-message('{"id":1,"method":"ping"}');
+	ok %msg<error>:exists, 'Returns error for missing jsonrpc';
+};
+
+subtest 'Parse missing method' => {
+	plan 1;
+	my %msg = parse-message('{"jsonrpc":"2.0","id":1}');
+	ok %msg<error>:exists, 'Returns error for missing method';
+};
+
+subtest 'Success response' => {
+	plan 3;
+	my %resp = success-response(1, { tools => [] });
+	is %resp<jsonrpc>, '2.0', 'jsonrpc';
+	is %resp<id>, 1, 'id matches';
+	is-deeply %resp<result><tools>, [], 'result present';
+};
+
+subtest 'Error response' => {
+	plan 3;
+	my %resp = error-response(1, METHOD_NOT_FOUND, 'Not found');
+	is %resp<error><code>, -32601, 'error code';
+	is %resp<error><message>, 'Not found', 'error message';
+	is %resp<id>, 1, 'id matches';
+};
+
+subtest 'Format message' => {
+	plan 1;
+	my $json = format-message({ jsonrpc => '2.0', id => 1, result => {} });
+	ok $json.ends-with("\n"), 'Ends with newline';
+};
+
+done-testing;

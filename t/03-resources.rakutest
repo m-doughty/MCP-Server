@@ -1,0 +1,53 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+
+plan 4;
+
+my $server = MCP::Server.new(:name<test>);
+
+$server.resource: 'config://app',
+	name => 'App Config',
+	description => 'Application configuration',
+	mime-type => 'application/json',
+	handler => -> :%args { '{"debug": true}' };
+
+subtest 'Resources list' => {
+	plan 2;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'resources/list',
+	});
+	is %resp<result><resources>.elems, 1, 'One resource';
+	is %resp<result><resources>[0]<name>, 'App Config', 'Resource name';
+};
+
+subtest 'Resource read' => {
+	plan 2;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'resources/read',
+		params => { uri => 'config://app' },
+	});
+	is %resp<result><contents>[0]<uri>, 'config://app', 'URI in response';
+	is %resp<result><contents>[0]<text>, '{"debug": true}', 'Content returned';
+};
+
+subtest 'Resource read — unknown' => {
+	plan 1;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'resources/read',
+		params => { uri => 'config://missing' },
+	});
+	ok %resp<error>:exists, 'Error for unknown resource';
+};
+
+subtest 'Resource mime type' => {
+	plan 1;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 4, method => 'resources/read',
+		params => { uri => 'config://app' },
+	});
+	is %resp<result><contents>[0]<mimeType>, 'application/json', 'MIME type in response';
+};
+
+done-testing;

@@ -1,0 +1,101 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+
+plan 7;
+
+my $server = MCP::Server.new(:name<test>, :version<1.0>);
+
+$server.tool: 'echo',
+	description => 'Echo back the input',
+	params => { message => { type => 'string', description => 'Message to echo', required => True } },
+	handler => -> :%args { %args<message> };
+
+$server.tool: 'add',
+	description => 'Add two numbers',
+	params => {
+		a => { type => 'number', required => True },
+		b => { type => 'number', required => True },
+	},
+	handler => -> :%args { ~(%args<a> + %args<b>) };
+
+subtest 'Tools list' => {
+	plan 2;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	is %resp<result><tools>.elems, 2, 'Two tools registered';
+	ok %resp<result><tools>.first(*<name> eq 'echo').defined, 'Echo tool found';
+};
+
+subtest 'Tool schema' => {
+	plan 2;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/list',
+	});
+	my %echo = %resp<result><tools>.first(*<name> eq 'echo');
+	is %echo<inputSchema><properties><message><type>, 'string', 'Param type in schema';
+	ok %echo<inputSchema><required>.first(* eq 'message').defined, 'Required param listed';
+};
+
+subtest 'Tool call — echo' => {
+	plan 2;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'tools/call',
+		params => { name => 'echo', arguments => { message => 'hello world' } },
+	});
+	ok %resp<result><content>.defined, 'Has content';
+	is %resp<result><content>[0]<text>, 'hello world', 'Echo returns input';
+};
+
+subtest 'Tool call — add' => {
+	plan 1;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 4, method => 'tools/call',
+		params => { name => 'add', arguments => { a => 10, b => 20 } },
+	});
+	is %resp<result><content>[0]<text>, '30', 'Add returns sum';
+};
+
+subtest 'Tool call — unknown tool' => {
+	plan 1;
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 5, method => 'tools/call',
+		params => { name => 'nonexistent', arguments => {} },
+	});
+	ok %resp<error>:exists, 'Error for unknown tool';
+};
+
+subtest 'Tool call — handler error' => {
+	plan 2;
+	$server.tool: 'fail',
+		handler => -> :%args { die 'intentional error' };
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 6, method => 'tools/call',
+		params => { name => 'fail', arguments => {} },
+	});
+	ok %resp<result><isError>, 'Error flag set';
+	ok %resp<result><content>[0]<text>.contains('intentional'), 'Error message in content';
+};
+
+subtest 'Tool group with / prefix' => {
+	plan 3;
+	my $gs = MCP::Server.new(:name<group-test>);
+	$gs.tool-group: 'file', -> $g {
+		$g.tool: 'read', handler => -> :%args { 'file content' };
+		$g.tool: 'list', handler => -> :%args { 'dir listing' };
+	};
+	my %resp = $gs.handle-request({
+		jsonrpc => '2.0', id => 10, method => 'tools/list',
+	});
+	is %resp<result><tools>.elems, 2, 'Two grouped tools';
+	ok %resp<result><tools>.first(*<name> eq 'file/read').defined, 'file/read registered';
+	my %call = $gs.handle-request({
+		jsonrpc => '2.0', id => 11, method => 'tools/call',
+		params => { name => 'file/list', arguments => {} },
+	});
+	is %call<result><content>[0]<text>, 'dir listing', 'Grouped tool callable';
+};
+
+done-testing;

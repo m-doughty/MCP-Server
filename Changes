@@ -1,0 +1,14 @@
+Revision history for MCP::Server
+
+{{$NEXT}}
+
+0.1.0  2026-04-09T12:23:43+01:00
+    - Initial release
+    - MCP (Model Context Protocol) server framework for Raku
+    - JSON-RPC 2.0 protocol handling with full error codes
+    - Tool registration with JSON Schema generation and parameter validation
+    - Resource registration with URI-based access
+    - Prompt registration with argument support
+    - Stdio transport (stdin/stdout)
+    - Pluggable transport architecture via Transport role
+    - Examples: echo server, weather server (wttr.in), file server, strawberry counter
