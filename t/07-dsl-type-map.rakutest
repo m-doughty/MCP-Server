@@ -1,0 +1,81 @@
+use Test;
+use lib 'lib';
+
+plan 13;
+use MCP::Server::DSL;
+
+# Test 1: Default type mappings in tool schema (Str maps to string)
+{
+    mcp TypedService {
+        method echo(Str :$msg!) { $msg }
+    }
+    my $obj = TypedService.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %echo = %resp<result><tools>.first(*<name> eq 'echo');
+    is %echo<inputSchema><properties><msg><type>, 'string', 'Str maps to string';
+    is %echo<inputSchema><required>, 'msg', 'Correct requires';
+}
+
+# Test 2: mcp-type trait on attribute
+{
+    mcp TypedService2 {
+        has Int $.num is mcp-type<number>;
+        method get-num() { $!num }
+    }
+    my $obj = TypedService2.new(num => 42);
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my @tools = %resp<result><tools>;
+    ok @tools.elems >= 1, 'Method registers as tool';
+}
+
+# Test 3: Multiple typed parameters
+{
+    mcp MultiType {
+        method mixed(Str :$s!, Int :$i!, Bool :$b) { }
+    }
+    my $obj = MultiType.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %mixed = %resp<result><tools>.first(*<name> eq 'mixed');
+    is %mixed<inputSchema><properties><s><type>, 'string', 'Str param is string';
+    is %mixed<inputSchema><properties><i><type>, 'integer', 'Int param maps to integer';
+    is %mixed<inputSchema><properties><b><type>, 'boolean', 'Bool param maps to boolean';
+    is %mixed<inputSchema><required>.sort, <s i>.sort, 'Correct requires';
+}
+
+# Test 4: Default values with type
+{
+    mcp Defaults {
+        method with-default(Str :$mode = 'auto', Int :$limit = 100) { }
+    }
+    my $obj = Defaults.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %wd = %resp<result><tools>.first(*<name> eq 'with-default');
+    is %wd<inputSchema><properties><mode><type>, 'string', 'Default Str param is string';
+    is %wd<inputSchema><properties><limit><type>, 'integer', 'Default Int param maps to integer';
+    is %wd<inputSchema><required>, Any, 'Correct requires';
+}
+
+# Test 5: Optional params with types
+{
+    mcp Optional {
+        method optionals(Str :$name?, Int :$count?) { }
+    }
+    my $obj = Optional.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %opt = %resp<result><tools>.first(*<name> eq 'optionals');
+    ok %opt<inputSchema><properties><name><type> eq 'string', 'Optional Str is string';
+    ok %opt<inputSchema><properties><count><type> eq 'integer', 'Optional Int maps to integer';
+    is %opt<inputSchema><required>, Any, 'Correct requires';
+}
+
+done-testing;

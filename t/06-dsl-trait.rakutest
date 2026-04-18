@@ -1,0 +1,70 @@
+use Test;
+use lib 'lib';
+
+plan 11;
+use MCP::Server::DSL;
+
+# Test 1: Basic trait application
+{
+    class Foo {
+        has Str $.name is mcp-type<string>;
+    }
+    my $attr = Foo.^attributes.first(*.name eq '$!name');
+    is $attr.mcp-type, 'string', 'Basic trait application sets mcp-type';
+}
+
+# Test 2: Trait with different type values
+{
+    class Bar {
+        has Int  $.count is mcp-type<integer>;
+        has Bool $.flag  is mcp-type<boolean>;
+        has Num  $.score is mcp-type<number>;
+    }
+    my @attrs = Bar.^attributes.grep(*.name eq any(<$!count $!flag $!score>));
+    is @attrs.first(*.name eq '$!count').mcp-type, 'integer', 'Int with integer type';
+    is @attrs.first(*.name eq '$!flag').mcp-type, 'boolean', 'Bool with boolean type';
+    is @attrs.first(*.name eq '$!score').mcp-type, 'number', 'Num with number type';
+    # Default type mapping still works for unannotated attributes
+    class NoTrait {
+        has Str $.text;
+    }
+    my $text-attr = NoTrait.^attributes.first(*.name eq '$!text');
+    ok !$text-attr.?mcp-type.defined, 'Untyped attribute gets no mcp-type';
+}
+
+# Test 3: Trait on untyped attribute (should still set mcp-type)
+{
+    class Baz {
+        has $.anything is mcp-type<string>;
+    }
+    my $attr = Baz.^attributes.first(*.name eq '$!anything');
+    is $attr.mcp-type, 'string', 'Trait works on untyped attribute';
+}
+
+# Test 4: Trait is exportable
+{
+    # The trait should be available after importing MCP::DECLARE
+    class Exportable {
+        has Str $.foo is mcp-type<string>;
+    }
+    my $attr = Exportable.^attributes.first(*.name eq '$!foo');
+    is $attr.mcp-type, 'string', 'Trait available without prefix after import';
+}
+
+# Test 5: Multiple traits on different attributes
+{
+    class Multi {
+        has Str $.a is mcp-type<string>;
+        has Int $.b is mcp-type<integer>;
+        has Str $.c is mcp-type<string>;
+    }
+    my $a = Multi.^attributes.first(*.name eq '$!a');
+    my $b = Multi.^attributes.first(*.name eq '$!b');
+    my $c = Multi.^attributes.first(*.name eq '$!c');
+    is $a.mcp-type, 'string', 'Attribute a has correct type';
+    is $b.mcp-type, 'integer', 'Attribute b has correct type';
+    is $c.mcp-type, 'string', 'Attribute c has correct type';
+    ok($a.mcp-type ne $b.mcp-type, 'No cross-contamination between attributes');
+}
+
+done-testing;
