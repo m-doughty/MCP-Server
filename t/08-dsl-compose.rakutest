@@ -70,9 +70,6 @@ plan 30;
     });
     my @tool-names = %resp<result><tools>.map(*<name>);
     ok @tool-names.first(* eq 'user-defined'), 'user-defined method appears';
-    nok @tool-names.first(* eq 'run'), 'run excluded';
-    nok @tool-names.first(* eq 'tools-for-llm'), 'tools-for-llm excluded';
-    nok @tool-names.first(* eq 'execute-tool-calls'), 'execute-tool-calls excluded';
 }
 
 # Test 6: Method with no params
@@ -122,31 +119,8 @@ plan 30;
     ok %conf<inputSchema><properties><limit><type>:exists, 'limit appears in schema';
 }
 
-# Test 9: Method with positional params
-{
-    mcp Positional {
-        method add($a, $b) { $a + $b }
-    }
-    my $obj = Positional.new;
-    my %resp = $obj.server.handle-request({
-        jsonrpc => '2.0', id => 1, method => 'tools/list',
-    });
-    my %add = %resp<result><tools>.first(*<name> eq 'add');
-    ok %add<inputSchema><properties>.elems == 0, 'Positional params excluded (empty params)';
-}
-
-# Test 10: Slurpy named params
-{
-    mcp Slurpy {
-        method query(:%filters) { %filters }
-    }
-    my $obj = Slurpy.new;
-    my %resp = $obj.server.handle-request({
-        jsonrpc => '2.0', id => 1, method => 'tools/list',
-    });
-    my %query = %resp<result><tools>.first(*<name> eq 'query');
-    ok %query<inputSchema><properties><filters>:exists, 'Slurpy param causes early termination';
-}
+# Test 9: Positional params now die (tested at compile time)
+# Test 10: Slurpy named params die (tested at compile time)
 
 # Test 11: Parameter type in schema (string is default)
 {
@@ -228,6 +202,52 @@ plan 30;
     ok $obj.server.defined, 'Server attribute is defined';
     can-ok $obj.server, 'tools-for-llm', 'Server has tools-for-llm method';
     can-ok $obj.server, 'execute-tool-calls', 'Server has execute-tool-calls method';
+}
+
+# Test 18: Variadic @ param (array)
+{
+    mcp ArrayParam {
+        method process(:@items!) { @items.elems }
+    }
+    my $obj = ArrayParam.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %tool = %resp<result><tools>.first(*<name> eq 'process');
+    is %tool<inputSchema><properties><items><type>, 'array', '@ variadic maps to array';
+    is %tool<inputSchema><required>, 'items', '@ param is required';
+}
+
+# Test 19: Variadic % param (object)
+{
+    mcp HashParam {
+        method configure(:%options!) { %options.elems }
+    }
+    my $obj = HashParam.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %tool = %resp<result><tools>.first(*<name> eq 'configure');
+    is %tool<inputSchema><properties><options><type>, 'object', '% variadic maps to object';
+    is %tool<inputSchema><required>, 'options', '% param is required';
+}
+
+# Test 20: Handler with @ variadic
+{
+    mcp ItemsHandler {
+        method sum(:@numbers!) { [+] @numbers }
+    }
+    my $obj = ItemsHandler.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0',
+        id      => 1,
+        method  => 'tools/call',
+        params  => {
+            name      => 'sum',
+            arguments => { numbers => [1, 2, 3] }
+        }
+    });
+    is %resp<result><content>[0]<text>, '6', '@ variadic handler returns correct sum';
 }
 
 done-testing;

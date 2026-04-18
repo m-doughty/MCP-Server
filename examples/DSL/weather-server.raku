@@ -3,7 +3,7 @@ use lib 'lib';
 use MCP::Server::DSL;
 
 #| Provides weather information via wttr.in
-mcp WheatherServer:ver<1.0> {
+mcp WeatherServer:ver<1.0> {
 
 	#| Get current weather for a location
 	method get-weather(
@@ -36,4 +36,4 @@ mcp WheatherServer:ver<1.0> {
 	}
 }
 
-WheatherServer.new.run;
+WeatherServer.new.run;

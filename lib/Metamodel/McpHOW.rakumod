@@ -12,22 +12,35 @@ class MCP::Base {
 }
 
 my %type-map = %(
-	Any  => "string",
-	Str  => "string",
-	Int  => "integer",
-	Bool => "boolean",
+	Any         => "string",
+	Str         => "string",
+	Int         => "integer",
+	Bool        => "boolean",
+	Num         => "number",
+	Rat         => "number",
+	Positional  => "array",
+	Associative => "object",
 );
 
 multi type-map(Parameter $_ where *.?mcp-type) {
 	.mcp-type
 }
 
-multi type-map(Parameter $_) {
-	type-map .type
+multi type-map(Parameter $par) {
+	CATCH {
+		default {
+			die "Type `{$par.type.^name}` for `{$par.gist}` can not be auto converted to json type. Please, use `is mcp-type` for that type."
+		}
+	}
+	type-map $par.type
 }
 
-multi type-map(Mu $_ where *.HOW ~~ Metamodel::CoercionHOW) {
-	nextwith .^constraint_type
+multi type-map(Mu $_ where { .HOW ~~ Metamodel::CoercionHOW }) {
+	type-map .^constraint_type
+}
+
+multi type-map(Mu $_ where { %type-map{.^name}:!exists }) {
+	die "Type {.^name} can not be auto converted to json type. Please, use `is mcp-type` for that type."
 }
 
 multi type-map(Mu $_) {
@@ -45,20 +58,14 @@ method compose(Mu $_) {
 		|(instructions => ~.WHY  if .WHY ),
 	);
 
-	my @tools = do for .^methods -> &method {
+	my @tools = do for .^methods: :local -> &method {
 		my $name  = &method.name;
-		next if $name eq (
-			| "POPULATE"
-			| "TWEAK"
-			| "server"
-			| "run"
-			| "tools-for-llm"
-			| "execute-tool-calls"
-			| "handle-request"
-		);
+		next if $name eq "POPULATE";
 		my $description = &method.WHY;
-		my %params     := Map.new: &method.signature.params.skip.grep(*.named).map: {
-			last if .slurpy;
+		my %params     := Map.new: &method.signature.params.skip.map: {
+			next if .name eq '%_';
+			die "MCP::Server::DSL does not accept slurp parameters ({&method.name} -> {.gist})." if .slurpy;
+			die "MCP::Server::DSL does not accept positional parameters ({&method.name} -> {.gist})." unless .named;
 			my $name = .named_names.head;
 
 			$name => %(
@@ -72,7 +79,7 @@ method compose(Mu $_) {
 			.tool: $name,
 			|(:description(.Str) with $description),
 			:%params,
-			:handler(-> :%args { $obj."$name"(|%args) })
+			:handler(-> :%args { $obj.&method(|%args) })
 		}
 	}
 
