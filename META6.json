@@ -6,7 +6,7 @@
   "build-depends": [
   ],
   "depends": [
-    "JSON::Fast:auth<cpan:TIMOTIMO>"
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
   ],
   "description": "MCP (Model Context Protocol) server framework for Raku",
   "license": "Artistic-2.0",
@@ -14,12 +14,14 @@
   "perl": "6.d",
   "provides": {
     "MCP::Server": "lib/MCP/Server.rakumod",
+    "MCP::Server::DSL": "lib/MCP/Server/DSL.rakumod",
     "MCP::Server::Prompt": "lib/MCP/Server/Prompt.rakumod",
     "MCP::Server::Protocol": "lib/MCP/Server/Protocol.rakumod",
     "MCP::Server::Resource": "lib/MCP/Server/Resource.rakumod",
     "MCP::Server::Tool": "lib/MCP/Server/Tool.rakumod",
     "MCP::Server::Transport": "lib/MCP/Server/Transport.rakumod",
-    "MCP::Server::Transport::Stdio": "lib/MCP/Server/Transport/Stdio.rakumod"
+    "MCP::Server::Transport::Stdio": "lib/MCP/Server/Transport/Stdio.rakumod",
+    "Metamodel::McpHOW": "lib/Metamodel/McpHOW.rakumod"
   },
   "resources": [
   ],
@@ -34,5 +36,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.1"
+  "version": "0.1.2"
 }

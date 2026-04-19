@@ -2,6 +2,9 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.1.2  2026-04-19T10:21:15+01:00
+    - added DSL for MCP::Server (shout-out to zef:FCO)
+
 0.1.1  2026-04-09T12:37:47+01:00
     - tools-for-llm: convert registered tools to OpenAI function-calling format
     - execute-tool-calls: route LLM tool call requests to registered handlers
