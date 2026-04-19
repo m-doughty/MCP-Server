@@ -1,0 +1,260 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server::DSL;
+
+plan 25;
+
+# Test 1: Complete DSL usage
+{
+    mcp MathService {
+        #| Perform arithmetic on two numbers
+        method add(Int :$a!, Int :$b!) { $a + $b }
+        method subtract(Int :$a!, Int :$b!) { $a - $b }
+
+        #| Multiply two numbers
+        method multiply(Int :$a!, Int :$b!) { $a * $b }
+    }
+
+    my $svc = MathService.new;
+    ok $svc.server.defined, 'Instance has .server attribute';
+
+    my %resp = $svc.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    is %resp<result><tools>.elems, 3, 'tools/list returns all 3 tools';
+
+    my %add = %resp<result><tools>.first(*<name> eq 'add');
+    ok %add<inputSchema><properties><a>:exists, 'add tool has a param';
+    ok %add<inputSchema><properties><b>:exists, 'add tool has b param';
+}
+
+# Test 2: Tool execution via MCP protocol
+{
+    mcp MathService2 {
+        method add(Int :$a!, Int :$b!) { $a + $b }
+    }
+
+    my $svc = MathService2.new;
+    my %resp = $svc.server.handle-request({
+        jsonrpc => '2.0',
+        id => 1,
+        method => 'tools/call',
+        params => {
+            name => 'add',
+            arguments => { a => 5, b => 3 }
+        }
+    });
+    is %resp<result><content>[0]<text>, '8', 'Tool returns correct result';
+}
+
+# Test 3: Multiple instances have independent servers
+{
+    mcp Counter {
+        has Int $.count = 0;
+        method increment(Int :$by = 1) { $!count += $by; $!count }
+    }
+
+    my $c1 = Counter.new;
+    my $c2 = Counter.new;
+    $c1.increment(by => 5);
+    $c2.increment(by => 10);
+
+    is $c1.count, 5, 'First instance count is 5';
+    is $c2.count, 10, 'Second instance count is 10';
+}
+
+# Test 4: Inheritance
+{
+    mcp BaseService {
+        method ping() { 'pong' }
+    }
+    mcp DerivedService is BaseService {
+        method extra() { 'extra' }
+    }
+
+    my $obj = DerivedService.new;
+    ok $obj.server.defined, 'Instance has server';
+}
+
+# Test 5: Role consumption
+{
+    role Greeter {
+        method greet(Str :$name!) { "Hello, $name" }
+    }
+
+    mcp GreeterService does Greeter { }
+
+    my $obj = GreeterService.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    ok %resp<result><tools>.first(*<name> eq 'greet').defined, 'Role method becomes tool';
+}
+
+# Test 6: Default values in tool parameters
+{
+    mcp Defaults {
+        method greet(:$name = 'World') { "Hello, $name" }
+    }
+
+    my $obj = Defaults.new;
+
+    # Call with no arguments - uses default
+    my %resp1 = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'greet', arguments => {} },
+    });
+    is %resp1<result><content>[0]<text>, 'Hello, World', 'Default value used';
+
+    # Call with arguments - uses provided values
+    my %resp2 = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 2, method => 'tools/call',
+        params => { name => 'greet', arguments => { name => 'Alice' } },
+    });
+    is %resp2<result><content>[0]<text>, 'Hello, Alice', 'Provided value used';
+}
+
+# Test 7: Tool execution works
+{
+    mcp Failer {
+        method oops() { 'failed' }
+    }
+
+    my $obj = Failer.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'oops', arguments => {} },
+    });
+    ok %resp<result><content>:exists, 'Tool response returned';
+}
+
+# Test 8: Complex parameter types
+{
+    mcp Complex {
+        method process(Str :$mode, Int :$limit, Bool :$verbose) { 'processed' }
+    }
+
+    my $obj = Complex.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %proc = %resp<result><tools>.first(*<name> eq 'process');
+    is %proc<inputSchema><properties><mode><type>, 'string', 'Str param type is string';
+    is %proc<inputSchema><properties><limit><type>, 'integer', 'Int param type is integer';
+    is %proc<inputSchema><properties><verbose><type>, 'boolean', 'Bool param type is boolean';
+}
+
+# Test 9: No methods = empty tools list
+{
+    mcp EmptyService { }
+
+    my $obj = EmptyService.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    is %resp<result><tools>.elems, 0, 'tools/list returns empty tools array';
+}
+
+# Test 10: Method returning complex data
+{
+    mcp DataService {
+        method get-data() { '{ "status": "ok", "items": [1,2,3] }' }
+    }
+
+    my $obj = DataService.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'get-data', arguments => {} },
+    });
+    my $text = %resp<result><content>[0]<text>;
+    my $data = from-json($text);
+    is $data<status>, 'ok', 'Status returned';
+    is $data<items>.elems, 3, 'Complex structure handled';
+}
+
+# Test 11: Methods work without class-level docs
+{
+    mcp ApiService {
+        method echo(Str :$msg!) { $msg }
+    }
+
+    my $obj = ApiService.new;
+    ok $obj.server.defined, 'Server is available';
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %echo = %resp<result><tools>.first(*<name> eq 'echo');
+    ok %echo<description>:!exists, 'No description when method has no doc';
+    is %echo<inputSchema><properties><msg><type>, 'string', 'Str param works';
+}
+
+# Test 12: Handler reads instance state via MCP protocol
+{
+    mcp Counter12 {
+        has Int $.count = 10;
+        method get-count() { $!count }
+    }
+
+    my $obj = Counter12.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'get-count', arguments => {} }
+    });
+    is %resp<result><content>[0]<text>, '10', 'Handler reads instance attribute via MCP protocol';
+}
+
+# Test 13: Handler modifies instance attribute
+{
+    mcp Incrementer {
+        has Int $.value = 0;
+        method add(Int :$n!) { $!value += $n; $!value }
+    }
+
+    my $obj = Incrementer.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'add', arguments => { n => 5 } }
+    });
+    is %resp<result><content>[0]<text>, '5', 'Handler modifies instance attribute';
+}
+
+# Test 14: Multiple tool calls modify state
+{
+    mcp Stateful {
+        has Int $.total = 0;
+        method add(Int :$n!) { $!total += $n; $!total }
+    }
+
+    my $obj = Stateful.new;
+    
+    # First call: add 3
+    $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'add', arguments => { n => 3 } }
+    });
+    
+    # Second call: add 2
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 2, method => 'tools/call',
+        params => { name => 'add', arguments => { n => 2 } }
+    });
+    is %resp<result><content>[0]<text>, '5', 'State persists across multiple tool calls';
+}
+
+# Test 15: Handler returns stored data from instance
+{
+    mcp Store {
+        has Str $.message = 'default';
+        method get-message() { $!message }
+    }
+
+    my $obj = Store.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'get-message', arguments => {} }
+    });
+    is %resp<result><content>[0]<text>, 'default', 'Handler returns stored value';
+}
+
+done-testing;

@@ -1,0 +1,161 @@
+use Test;
+use lib 'lib';
+
+plan 18;
+use MCP::Server::DSL;
+
+# Test 1: Basic parameter type mapping (Int -> integer)
+{
+    mcp Foo {
+        method echo(Str :$msg!) { $msg }
+    }
+    my $obj = Foo.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %echo = %resp<result><tools>.first(*<name> eq 'echo');
+    is %echo<inputSchema><properties><msg><type>, 'string', 'Str parameter maps to string';
+}
+
+# Test 2: Int maps to integer by default
+{
+    mcp Bar {
+        method params(Int :$num!, Bool :$flag!) { }
+    }
+    my $obj = Bar.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %p = %resp<result><tools>.first(*<name> eq 'params');
+    is %p<inputSchema><properties><num><type>, 'integer', 'Int maps to integer';
+    is %p<inputSchema><properties><flag><type>, 'boolean', 'Bool maps to boolean';
+}
+
+# Test 3: Custom mcp-type overrides default mapping
+{
+    mcp Override {
+        method int-param(Int :$val! is mcp-type<number>) { }
+    }
+    my $obj = Override.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %ip = %resp<result><tools>.first(*<name> eq 'int-param');
+    is %ip<inputSchema><properties><val><type>, 'number', 'mcp-type overrides Int to number';
+}
+
+# Test 4: Bool with custom mcp-type
+{
+    mcp BoolTest {
+        method flag(Bool :$active! is mcp-type<string>) { }
+    }
+    my $obj = BoolTest.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %f = %resp<result><tools>.first(*<name> eq 'flag');
+    is %f<inputSchema><properties><active><type>, 'string', 'mcp-type overrides Bool to string';
+}
+
+# Test 5: Multiple parameters with different types
+{
+    mcp Multi {
+        method mixed(Str :$a!, Int :$b!) { }
+    }
+    my $obj = Multi.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %m = %resp<result><tools>.first(*<name> eq 'mixed');
+    is %m<inputSchema><properties><a><type>, 'string', 'Str param is string';
+    is %m<inputSchema><properties><b><type>, 'integer', 'Int param is integer';
+}
+
+# Test 6: Optional parameters
+{
+    mcp Opt {
+        method with-opt(Str :$name?) { }
+    }
+    my $obj = Opt.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %wo = %resp<result><tools>.first(*<name> eq 'with-opt');
+    ok %wo<inputSchema><properties><name><type> eq 'string', 'Optional Str is string';
+    nok %wo<inputSchema><required>:exists, 'Optional param is not required';
+}
+
+# Test 7: Handler uses parameter with trait
+{
+    mcp Handler {
+        method double(Int :$n! is mcp-type<number>) { $n * 2 }
+    }
+    my $obj = Handler.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/call',
+        params => { name => 'double', arguments => { n => 21 } }
+    });
+    is %resp<result><content>[0]<text>, '42', 'Handler uses parameter with custom mcp-type';
+}
+
+# Test 8: Trait available without prefix (exported)
+{
+    mcp Exportable {
+        method test(Str :$msg! is mcp-type<uri>) { }
+    }
+    my $obj = Exportable.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %t = %resp<result><tools>.first(*<name> eq 'test');
+    is %t<inputSchema><properties><msg><type>, 'uri', 'mcp-type trait is exported';
+}
+
+# Test 9: Custom type with mcp-type override
+{
+    mcp Unsupported {
+        method custom(Date :$date! is mcp-type<string>) { $date }
+    }
+    my $obj = Unsupported.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %p = %resp<result><tools>.first(*<name> eq 'custom');
+    is %p<inputSchema><properties><date><type>, 'string', 'Custom Date overridden to string via mcp-type';
+}
+
+# Test 10: Default type mapping with supported types
+{
+    mcp Types {
+        method mixed(
+            Str :$text!,
+            Int :$num!,
+            Bool :$flag!,
+            Num :$decimal!,
+            Rat :$ratio!
+        ) { }
+    }
+    my $obj = Types.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %m = %resp<result><tools>.first(*<name> eq 'mixed');
+    is %m<inputSchema><properties><text><type>, 'string', 'Str is string';
+    is %m<inputSchema><properties><num><type>, 'integer', 'Int is integer';
+    is %m<inputSchema><properties><flag><type>, 'boolean', 'Bool is boolean';
+    is %m<inputSchema><properties><decimal><type>, 'number', 'Num is number';
+    is %m<inputSchema><properties><ratio><type>, 'number', 'Rat is number';
+}
+
+# Test 11: Unsupported type without mcp-type dies with helpful error
+throws-like {
+    q:to/END/.EVAL;
+    use lib "lib";
+    use MCP::Server::DSL;
+    mcp Bad {
+        method process(IO :$file!) { }
+    }
+    END
+}, Exception, message => *.contains: "can not be auto converted";
+
+done-testing;

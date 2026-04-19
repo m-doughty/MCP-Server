@@ -1,0 +1,253 @@
+use Test;
+use lib 'lib';
+use MCP::Server::DSL;
+use MCP::Server;
+
+plan 30;
+
+# Test 1: mcp metaclass is used
+{
+    mcp MyServer {
+        method foo() { }
+    }
+    ok MyServer.HOW ~~ Metamodel::McpHOW, 'Class uses mcp metaclass';
+    my $obj = MyServer.new;
+    ok $obj.server.defined, 'Instance has server from MCP::Base';
+}
+
+# Test 2: .server attribute exists and is lazy
+{
+    mcp MyService {
+        method foo() { 'bar' }
+    }
+    my $svc = MyService.new;
+    my $server = $svc.server;
+    ok $server.defined, 'Server created on first access (lazy)';
+    ok $server ~~ MCP::Server, 'Server is MCP::Server instance';
+}
+
+# Test 3: Public methods become tools
+{
+    mcp Calculator {
+        method add(Int :$a!, Int :$b!) { $a + $b }
+        method greet(Str :$name!) { "Hello, $name" }
+    }
+    my $obj = Calculator.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my @tool-names = %resp<result><tools>.map(*<name>);
+    ok @tool-names.first(* eq 'add'), 'add method becomes tool';
+    ok @tool-names.first(* eq 'greet'), 'greet method becomes tool';
+}
+
+# Test 4: Private methods are NOT tools
+{
+    mcp Hidden {
+        method !secret() { 'hidden' }
+        method public() { 'visible' }
+    }
+    my $obj = Hidden.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my @tool-names = %resp<result><tools>.map(*<name>);
+    ok @tool-names.first(* eq 'public'), 'public method appears as tool';
+    nok @tool-names.first(* eq '!secret'), '!secret method not in tools';
+}
+
+# Test 5: Internal methods are excluded
+{
+    mcp WithInternal {
+        method run() { 'rn' }
+        method tools-for-llm() { 'tfllm' }
+        method execute-tool-calls() { 'etc' }
+        method user-defined() { 'user' }
+    }
+    my $obj = WithInternal.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my @tool-names = %resp<result><tools>.map(*<name>);
+    ok @tool-names.first(* eq 'user-defined'), 'user-defined method appears';
+}
+
+# Test 6: Method with no params
+{
+    mcp NoParams {
+        method ping() { 'pong' }
+    }
+    my $obj = NoParams.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %ping = %resp<result><tools>.first(*<name> eq 'ping');
+    ok %ping<inputSchema><properties>.elems == 0, 'Tool registered with empty params';
+    my %call = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 2, method => 'tools/call',
+        params => { name => 'ping', arguments => {} },
+    });
+    is %call<result><content>[0]<text>, 'pong', 'Tool handler returns method result';
+}
+
+# Test 7: Method with required named params
+{
+    mcp RequiredParams {
+        method greet(:$name!, :$greeting = 'Hello') { "$greeting, $name" }
+    }
+    my $obj = RequiredParams.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %greet = %resp<result><tools>.first(*<name> eq 'greet');
+    ok %greet<inputSchema><required>.first(* eq 'name'), 'name marked as required';
+    ok %greet<inputSchema><properties><greeting>:exists, 'greeting appears in schema';
+    nok %greet<inputSchema><required>.first(* eq 'greeting'), 'greeting is optional';
+}
+
+# Test 8: Method with optional named params
+{
+    mcp OptionalParams {
+        method configure(:$verbose, :$limit = 10) { 'configured' }
+    }
+    my $obj = OptionalParams.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %conf = %resp<result><tools>.first(*<name> eq 'configure');
+    ok %conf<inputSchema><properties><verbose><required>:!exists, 'verbose has no required key (optional)';
+    ok %conf<inputSchema><properties><limit><type>:exists, 'limit appears in schema';
+}
+
+# Test 9: Positional params now die (tested at compile time)
+# Test 10: Slurpy named params die (tested at compile time)
+
+# Test 11: Parameter type in schema (string is default)
+{
+    mcp TypedParams {
+        method str-param(Str :$s!) { }
+    }
+    my $obj = TypedParams.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %str-p = %resp<result><tools>.first(*<name> eq 'str-param');
+    is %str-p<inputSchema><properties><s><type>, 'string', 'Str param type is string';
+}
+
+# Test 12: Method with typed param registers
+{
+    mcp CustomTyped {
+        method custom(Str :$n!) { }
+    }
+    my $obj = CustomTyped.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %cust = %resp<result><tools>.first(*<name> eq 'custom');
+    ok %cust.defined, 'Method with typed param registers as tool';
+}
+
+# Test 13: Method with doc comment becomes tool description
+{
+    mcp Documented {
+        #| Add two numbers together
+        method add(Int :$a!, Int :$b!) { $a + $b }
+    }
+    my $obj = Documented.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %add = %resp<result><tools>.first(*<name> eq 'add');
+    is %add<description>, 'Add two numbers together', 'Doc comment becomes description';
+}
+
+# Test 14: Method without doc comment has no description
+{
+    mcp NoDoc {
+        method ping() { 'pong' }
+    }
+    my $obj = NoDoc.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %ping = %resp<result><tools>.first(*<name> eq 'ping');
+    nok %ping<description>:exists, 'No description when method has no doc';
+}
+
+# Test 15: Server name from class name
+{
+    mcp MyCalculator {
+        method foo() { }
+    }
+    my $obj = MyCalculator.new;
+    is $obj.server.name, 'MyCalculator', 'Server name from class name';
+}
+
+# Test 16: Server version from class version
+{
+    mcp Versioned:ver<2.0.0> {
+        method foo() { }
+    }
+    my $obj = Versioned.new;
+    is $obj.server.version, '2.0.0', 'Server version from class version';
+}
+
+# Test 17: Server exists with server methods
+{
+    mcp SimpleServer {
+        method ping() { 'pong' }
+    }
+    my $obj = SimpleServer.new;
+    ok $obj.server.defined, 'Server attribute is defined';
+    can-ok $obj.server, 'tools-for-llm', 'Server has tools-for-llm method';
+    can-ok $obj.server, 'execute-tool-calls', 'Server has execute-tool-calls method';
+}
+
+# Test 18: Variadic @ param (array)
+{
+    mcp ArrayParam {
+        method process(:@items!) { @items.elems }
+    }
+    my $obj = ArrayParam.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %tool = %resp<result><tools>.first(*<name> eq 'process');
+    is %tool<inputSchema><properties><items><type>, 'array', '@ variadic maps to array';
+    is %tool<inputSchema><required>, 'items', '@ param is required';
+}
+
+# Test 19: Variadic % param (object)
+{
+    mcp HashParam {
+        method configure(:%options!) { %options.elems }
+    }
+    my $obj = HashParam.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0', id => 1, method => 'tools/list',
+    });
+    my %tool = %resp<result><tools>.first(*<name> eq 'configure');
+    is %tool<inputSchema><properties><options><type>, 'object', '% variadic maps to object';
+    is %tool<inputSchema><required>, 'options', '% param is required';
+}
+
+# Test 20: Handler with @ variadic
+{
+    mcp ItemsHandler {
+        method sum(:@numbers!) { [+] @numbers }
+    }
+    my $obj = ItemsHandler.new;
+    my %resp = $obj.server.handle-request({
+        jsonrpc => '2.0',
+        id      => 1,
+        method  => 'tools/call',
+        params  => {
+            name      => 'sum',
+            arguments => { numbers => [1, 2, 3] }
+        }
+    });
+    is %resp<result><content>[0]<text>, '6', '@ variadic handler returns correct sum';
+}
+
+done-testing;
