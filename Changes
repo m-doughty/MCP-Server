@@ -2,6 +2,9 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.1.3  2026-04-29T23:51:53+01:00
+    - Bump Github actions to use node 24+
+
 0.1.2  2026-04-19T10:21:15+01:00
     - added DSL for MCP::Server (shout-out to zef:FCO)
 
