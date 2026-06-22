@@ -64,36 +64,55 @@ method tools-for-llm(--> List) {
 method execute-tool-calls(@tool-calls --> List) {
 	@tool-calls.map(-> %tc {
 		my $fn-name = %tc<function><name>;
-		my $args-json = %tc<function><arguments> // '{}';
+		my $args = %tc<function><arguments> // {};
 		my $call-id = %tc<id> // '';
 
 		my %arguments;
-		try {
-			%arguments = from-json($args-json);
-			CATCH { default { } }
-		}
-
 		my $result;
 		my $is-error = False;
-		if %!tools{$fn-name}:exists {
+
+		if $args ~~ Associative {
+			%arguments = $args.Hash;
+		} else {
 			try {
-				$result = %!tools{$fn-name}.call(%arguments);
+				my $parsed = from-json($args.Str);
+				if $parsed ~~ Associative {
+					%arguments = $parsed.Hash;
+				} else {
+					$result = 'Tool arguments must be a JSON object';
+					$is-error = True;
+				}
 				CATCH {
 					default {
-						$result = .message;
+						$result = "Invalid tool arguments JSON: {.message}";
 						$is-error = True;
 					}
 				}
 			}
-		} else {
-			$result = "Unknown tool: '$fn-name'";
-			$is-error = True;
+		}
+
+		if !$is-error {
+			if %!tools{$fn-name}:exists {
+				try {
+					$result = %!tools{$fn-name}.call(%arguments);
+					CATCH {
+						default {
+							$result = .message;
+							$is-error = True;
+						}
+					}
+				}
+			} else {
+				$result = "Unknown tool: '$fn-name'";
+				$is-error = True;
+			}
 		}
 
 		{
 			role => 'tool',
 			tool_call_id => $call-id,
 			content => ~($result // ''),
+			is_error => $is-error,
 		};
 	}).list;
 }

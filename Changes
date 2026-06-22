@@ -2,6 +2,12 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.2.0  2026-06-22T23:32:43+01:00
+    - execute-tool-calls now accepts function arguments supplied as
+      either a JSON string or an associative object, and returns an
+      `is_error` flag on malformed arguments, unknown tools, and
+      handler failures.
+
 0.1.3  2026-04-29T23:51:53+01:00
     - Bump Github actions to use node 24+
 

@@ -3,7 +3,7 @@ use lib 'lib';
 use JSON::Fast;
 use MCP::Server;
 
-plan 6;
+plan 8;
 
 my $server = MCP::Server.new(:name<test>);
 
@@ -79,7 +79,7 @@ subtest 'Execute multiple tool calls' => {
 };
 
 subtest 'Execute unknown tool returns error' => {
-	plan 1;
+	plan 2;
 	my @calls = [{
 		id => 'c3',
 		type => 'function',
@@ -87,6 +87,48 @@ subtest 'Execute unknown tool returns error' => {
 	},];
 	my @results = $server.execute-tool-calls(@calls);
 	ok @results[0]<content>.contains('Unknown tool'), 'Error for unknown tool';
+	ok @results[0]<is_error>, 'Unknown tool is marked as error';
+};
+
+subtest 'Execute accepts associative arguments' => {
+	plan 2;
+	my @calls = [{
+		id => 'c4',
+		type => 'function',
+		function => { name => 'get_weather', arguments => { location => 'Berlin' } },
+	},];
+	my @results = $server.execute-tool-calls(@calls);
+	is @results[0]<content>, 'Sunny, 22C in Berlin', 'Associative arguments execute';
+	nok @results[0]<is_error>, 'Associative arguments are not an error';
+};
+
+subtest 'Execute invalid arguments and handler failures return error messages' => {
+	plan 4;
+
+	$server.tool: 'fail',
+		description => 'Always fail',
+		params => {},
+		handler => -> :%args { die 'boom' };
+
+	my @calls = [
+		{
+			id => 'c5',
+			type => 'function',
+			function => { name => 'get_weather', arguments => '{"location":' },
+		},
+		{
+			id => 'c6',
+			type => 'function',
+			function => { name => 'fail', arguments => '{}' },
+		},
+	];
+	my @results = $server.execute-tool-calls(@calls);
+
+	ok @results[0]<is_error>, 'Invalid JSON marked as error';
+	ok @results[0]<content>.contains('Invalid tool arguments JSON'),
+		'Invalid JSON error explains failure';
+	ok @results[1]<is_error>, 'Handler exception marked as error';
+	ok @results[1]<content>.contains('boom'), 'Handler exception message returned';
 };
 
 done-testing;

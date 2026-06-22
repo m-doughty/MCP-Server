@@ -92,6 +92,7 @@ use MCP::Server;
 use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
+use LLM::Chat::ToolLoop;
 
 # Define tools
 my $server = MCP::Server.new(:name<my-tools>);
@@ -109,17 +110,18 @@ my @tools = $server.tools-for-llm;
 my $backend = LLM::Chat::Backend::OpenAICommon.new(...);
 my @messages = (Message.new(:role<user>, :content<What is the weather in London?>),);
 
-my $resp = $backend.chat-completion(@messages, :@tools);
+my $loop = LLM::Chat::ToolLoop.new(
+    backend => $backend,
+    tools => @tools,
+    execute-tools => -> @calls { $server.execute-tool-calls(@calls) },
+);
 
-# If LLM wants to call a tool, execute it
-if $resp.has-tool-calls {
-    my @results = $server.execute-tool-calls($resp.tool-calls);
-    # @results are {role=>"tool", tool_call_id=>"...", content=>"..."}
-    # Append to messages and call LLM again for final answer
-}
+my $resp = $loop.chat-completion-stream(@messages);
+until $resp.is-done { sleep 0.01 }
+say $resp.msg if $resp.is-success;
 ```
 
-`tools-for-llm` converts registered tools to the OpenAI function-calling format. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back.
+`tools-for-llm` converts registered tools to the OpenAI function-calling format. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back. Tool results include `role`, `tool_call_id`, `content`, and `is_error`.
 
 Resources
 ---------
