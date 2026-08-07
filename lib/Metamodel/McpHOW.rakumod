@@ -1,14 +1,31 @@
 use MCP::Server;
+use MCP::Server::Toolkit;
 
 unit class Metamodel::McpHOW is Metamodel::ClassHOW;
 
 has &.build-server;
+has @.mcp-registrars;
 
-class MCP::Base {
-	has MCP::Server $.server handles <run tools-for-llm execute-tool-calls handle-request>;
-	submethod TWEAK(|) {
-		$!server = self.HOW.build-server.(self);
+class MCP::Base does MCP::Server::Toolkit {
+	# Private and lazy: the server is built on first use, and keeping it out of
+	# the public attribute list means .from-config never mistakes it for a
+	# configurable setting.
+	has MCP::Server $!server;
+
+	method server(--> MCP::Server) {
+		$!server //= self.HOW.build-server.(self);
 	}
+
+	#| MCP::Server::Toolkit: register this instance's methods as tools on any
+	#| server, so an mcp class can be plugged into a bigger server too.
+	method register($registrar) {
+		for self.HOW.mcp-registrars -> &reg { reg $registrar, :obj(self) }
+	}
+
+	method run(|c)                { self.server.run: |c }
+	method tools-for-llm(|c)      { self.server.tools-for-llm: |c }
+	method execute-tool-calls(|c) { self.server.execute-tool-calls: |c }
+	method handle-request(|c)     { self.server.handle-request: |c }
 }
 
 my %type-map = %(
@@ -83,9 +100,11 @@ method compose(Mu $_) {
 		}
 	}
 
+	@!mcp-registrars = @tools;
+
 	&!build-server = -> $obj {
 		my $server = MCP::Server.new: |%server-data;
-		for @tools -> &tool { tool $server, :$obj }
+		for @!mcp-registrars -> &tool { tool $server, :$obj }
 		$server
 	}
 }

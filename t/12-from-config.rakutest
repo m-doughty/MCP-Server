@@ -1,0 +1,156 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use JSON::Fast;
+use MCP::Server;
+
+plan 8;
+
+my $scratch = $*TMPDIR.add("mcp-server-config-{$*PID}");
+$scratch.mkdir;
+LEAVE { try $scratch.dir».unlink; try $scratch.rmdir }
+
+my $counter = 0;
+
+#| Write $content to a fresh file in the scratch dir and return its path.
+sub config-file(Str:D $content --> IO::Path) {
+	my $path = $scratch.add("config-{$counter++}.json");
+	$path.spurt($content);
+	$path;
+}
+
+sub dies-with(&code, Str:D $needle, Str:D $desc) {
+	my Str $msg;
+	{
+		code();
+		CATCH { default { $msg = .message } }
+	}
+	my $matched = $msg.defined && $msg.contains($needle);
+	ok $matched, $desc;
+	diag "message was: {$msg // '(nothing thrown)'}" unless $matched;
+}
+
+sub tool-names($server) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 99, method => 'tools/list',
+	})<result><tools>.map(*<name>).sort.list;
+}
+
+subtest 'Full round trip' => {
+	plan 6;
+	my $path = config-file(to-json({
+		name         => 'configured',
+		version      => '3.2.1',
+		instructions => 'Be helpful',
+		tools        => { TestKit => { greeting => 'Salut' } },
+	}));
+
+	my $server = MCP::Server.from-config($path);
+	is $server.name, 'configured', 'Name from config';
+	is $server.version, '3.2.1', 'Version from config';
+	is $server.instructions, 'Be helpful', 'Instructions from config';
+	is-deeply tool-names($server), ('greet',), 'Toolkit loaded from config';
+
+	my %init = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'initialize', params => {},
+	});
+	is %init<result><serverInfo><name>, 'configured', 'Name advertised on initialize';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => { name => 'greet', arguments => { name => 'Ada' } },
+	});
+	is %call<result><content>[0]<text>, 'Salut, Ada', 'Config reached the handler';
+};
+
+subtest 'Path may be a plain string' => {
+	plan 1;
+	my $path = config-file(to-json({ name => 'stringly', tools => {} }));
+	is MCP::Server.from-config($path.Str).name, 'stringly', 'IO() coercion accepts a Str path';
+};
+
+subtest 'Alias keys (Name#alias) load the same toolkit twice' => {
+	plan 3;
+	my $path = config-file(to-json({
+		name  => 'aliased',
+		tools => {
+			'TestKit#a' => { greeting => 'Hi', prefix => 'a' },
+			'TestKit#b' => { greeting => 'Ho', prefix => 'b' },
+		},
+	}));
+
+	my $server = MCP::Server.from-config($path);
+	is-deeply tool-names($server), ('a_greet', 'b_greet'), 'Both aliases registered';
+
+	my %a = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'a_greet', arguments => { name => 'X' } },
+	});
+	is %a<result><content>[0]<text>, 'Hi, X', 'First alias keeps its config';
+
+	my %b = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => { name => 'b_greet', arguments => { name => 'X' } },
+	});
+	is %b<result><content>[0]<text>, 'Ho, X', 'Second alias keeps its config';
+};
+
+subtest 'Toolkit config may be omitted' => {
+	plan 1;
+	my $path = config-file('{ "name": "nullish", "tools": { "TestKit": null } }');
+	is-deeply tool-names(MCP::Server.from-config($path)), ('greet',),
+		'Null toolkit config means "use the defaults"';
+};
+
+subtest 'Missing file' => {
+	plan 1;
+	my $path = $scratch.add('definitely-not-here.json');
+	dies-with { MCP::Server.from-config($path) },
+		'Config file not found', 'Missing config file dies';
+};
+
+subtest 'Invalid JSON' => {
+	plan 2;
+	my $bad = config-file('{ "name": "broken", ');
+	dies-with { MCP::Server.from-config($bad) }, 'Invalid JSON in', 'Malformed JSON dies';
+
+	my $array = config-file('["not", "an", "object"]');
+	dies-with { MCP::Server.from-config($array) },
+		'top level must be an object', 'Non-object top level dies';
+};
+
+subtest 'Schema validation' => {
+	plan 4;
+	my $unknown = config-file(to-json({ name => 'x', tolls => {} }));
+	dies-with { MCP::Server.from-config($unknown) },
+		'Unknown key(s)', 'Unknown top-level key dies';
+
+	my $nameless = config-file(to-json({ version => '1.0' }));
+	dies-with { MCP::Server.from-config($nameless) },
+		"must set a string 'name'", 'Missing name dies';
+
+	my $empty-name = config-file(to-json({ name => '' }));
+	dies-with { MCP::Server.from-config($empty-name) },
+		"must set a string 'name'", 'Empty name dies';
+
+	my $bad-tools = config-file(to-json({ name => 'x', tools => ['TestKit',] }));
+	dies-with { MCP::Server.from-config($bad-tools) },
+		"'tools' in", 'Non-object tools section dies';
+};
+
+subtest 'Toolkit errors surface with the config path context' => {
+	plan 2;
+	my $bad-key = config-file(to-json({
+		name => 'x', tools => { TestKit => { greetng => 'typo' } },
+	}));
+	dies-with { MCP::Server.from-config($bad-key) },
+		'Unknown config key(s)', 'Toolkit config errors propagate';
+
+	my $bad-entry = config-file(to-json({
+		name => 'x', tools => { TestKit => 'a string' },
+	}));
+	dies-with { MCP::Server.from-config($bad-entry) },
+		'must be an object', 'Non-object toolkit config dies';
+};
+
+done-testing;

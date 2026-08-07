@@ -3,7 +3,7 @@ use lib 'lib';
 use JSON::Fast;
 use MCP::Server::Protocol;
 
-plan 7;
+plan 15;
 
 subtest 'Parse valid message' => {
 	plan 3;
@@ -51,6 +51,133 @@ subtest 'Format message' => {
 	plan 1;
 	my $json = format-message({ jsonrpc => '2.0', id => 1, result => {} });
 	ok $json.ends-with("\n"), 'Ends with newline';
+};
+
+subtest 'Version and error code constants' => {
+	plan 12;
+	is LEGACY-PROTOCOL-VERSION, '2025-11-25', 'Legacy protocol version';
+	is MODERN-PROTOCOL-VERSION, '2026-07-28', 'Modern protocol version';
+	is-deeply SUPPORTED-PROTOCOL-VERSIONS.List, (LEGACY-PROTOCOL-VERSION, MODERN-PROTOCOL-VERSION).List,
+		'Supported versions lists both eras';
+	is-deeply MODERN-PROTOCOL-VERSIONS.List, (MODERN-PROTOCOL-VERSION,).List,
+		'Modern versions lists only the modern era';
+	is HEADER_MISMATCH, -32020, 'Header mismatch code';
+	is MISSING_REQUIRED_CLIENT_CAPABILITY, -32021, 'Missing required client capability code';
+	is UNSUPPORTED_PROTOCOL_VERSION, -32022, 'Unsupported protocol version code';
+	is META-PROTOCOL-VERSION, 'io.modelcontextprotocol/protocolVersion', 'Meta protocol version key';
+	is META-CLIENT-CAPABILITIES, 'io.modelcontextprotocol/clientCapabilities', 'Meta client capabilities key';
+	is META-CLIENT-INFO, 'io.modelcontextprotocol/clientInfo', 'Meta client info key';
+	is META-SERVER-INFO, 'io.modelcontextprotocol/serverInfo', 'Meta server info key';
+	is META-LOG-LEVEL, 'io.modelcontextprotocol/logLevel', 'Meta log level key';
+};
+
+subtest 'Detect era: priority rules' => {
+	plan 6;
+	is detect-era({ jsonrpc => '2.0', id => 1, method => 'initialize' }), 'legacy',
+		'initialize with no _meta is legacy';
+	is detect-era({
+		jsonrpc => '2.0', id => 1, method => 'initialize',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	}), 'legacy', 'initialize carrying a stray modern _meta is still legacy';
+	is detect-era({ jsonrpc => '2.0', id => 2, method => 'server/discover' }), 'modern',
+		'bare server/discover is modern';
+	is detect-era({
+		jsonrpc => '2.0', id => 2, method => 'server/discover', params => {},
+	}), 'modern', 'server/discover with params but no _meta is still modern';
+	is detect-era({
+		jsonrpc => '2.0', id => 3, method => 'tools/call',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	}), 'modern', 'a _meta protocolVersion marker is modern';
+	is detect-era({ jsonrpc => '2.0', id => 4, method => 'tools/call' }), 'legacy',
+		'no method match and no _meta marker falls back to legacy';
+};
+
+subtest 'Detect era: malformed _meta' => {
+	plan 4;
+	is detect-era({
+		jsonrpc => '2.0', id => 1, method => 'tools/call', params => 'not-a-hash',
+	}), 'legacy', 'non-hash params falls back to legacy';
+	is detect-era({
+		jsonrpc => '2.0', id => 1, method => 'tools/call', params => { _meta => 'not-a-hash' },
+	}), 'legacy', 'non-hash _meta falls back to legacy';
+	is detect-era({ jsonrpc => '2.0', id => 1, method => 'tools/call' }), 'legacy',
+		'missing params falls back to legacy';
+	is detect-era({
+		jsonrpc => '2.0', id => 1, method => 'tools/call', params => { name => 'x' },
+	}), 'legacy', 'missing _meta falls back to legacy';
+};
+
+subtest 'modern-envelope' => {
+	plan 6;
+	my %server-info = name => 'test-server', version => '0.1.0';
+
+	my %resp = success-response(1, { tools => [] });
+	my %env = modern-envelope(%resp, :%server-info);
+	is %env<result><resultType>, 'complete', 'Injects resultType when absent';
+	is-deeply %env<result><_meta>{META-SERVER-INFO}, %server-info, 'Injects serverInfo into result _meta';
+
+	my %resp-with-type = success-response(2, { tools => [], resultType => 'custom' });
+	my %env-with-type = modern-envelope(%resp-with-type, :%server-info);
+	is %env-with-type<result><resultType>, 'custom', 'Respects a handler-set resultType';
+
+	my %resp-with-meta = success-response(3, { tools => [], _meta => { keep => 'me' } });
+	my %env-with-meta = modern-envelope(%resp-with-meta, :%server-info);
+	is %env-with-meta<result><_meta><keep>, 'me', 'Preserves pre-existing result _meta keys';
+	ok %env-with-meta<result><_meta>{META-SERVER-INFO}:exists,
+		'Still injects serverInfo alongside preserved _meta keys';
+
+	my %err = error-response(4, METHOD_NOT_FOUND, 'Not found');
+	is-deeply modern-envelope(%err, :%server-info), %err, 'Error responses pass through untouched';
+};
+
+subtest 'with-cacheability' => {
+	plan 5;
+	my %out = with-cacheability({}, :ttl-ms(1000), :cache-scope('private'));
+	is %out<ttlMs>, 1000, 'Adds ttlMs when absent';
+	is %out<cacheScope>, 'private', 'Adds cacheScope when absent';
+
+	my %preset = with-cacheability(
+		{ ttlMs => 5, cacheScope => 'public' }, :ttl-ms(1000), :cache-scope('private'),
+	);
+	is %preset<ttlMs>, 5, 'Does not clobber a pre-existing ttlMs';
+	is %preset<cacheScope>, 'public', 'Does not clobber a pre-existing cacheScope';
+
+	dies-ok { with-cacheability({}, :ttl-ms(1), :cache-scope('bogus')) },
+		'Invalid cache-scope dies';
+};
+
+subtest 'unsupported-protocol-version-error shape' => {
+	plan 5;
+	my %err = unsupported-protocol-version-error(
+		5, :requested('9999-01-01'), :supported(<2025-11-25 2026-07-28>),
+	);
+	is %err<id>, 5, 'id matches';
+	is %err<error><code>, UNSUPPORTED_PROTOCOL_VERSION, '-32022 error code';
+	ok %err<error><message>.chars > 0, 'Has a non-empty message';
+	is %err<error><data><requested>, '9999-01-01', 'data.requested matches';
+	is-deeply %err<error><data><supported>.List, <2025-11-25 2026-07-28>.List, 'data.supported matches';
+};
+
+subtest 'header-mismatch-error shape' => {
+	plan 3;
+	my %err = header-mismatch-error(6, :header-version('2026-07-28'), :meta-version('2025-11-25'));
+	is %err<id>, 6, 'id matches';
+	is %err<error><code>, HEADER_MISMATCH, '-32020 error code';
+	ok %err<error><message>.chars > 0, 'Has a non-empty message';
+};
+
+subtest 'log-level-at-least: RFC-5424 ordering and unknown levels' => {
+	my @levels = <debug info notice warning error critical alert emergency>;
+	plan @levels.elems ** 2 + 3;
+	for @levels.kv -> $i, $level {
+		for @levels.kv -> $j, $threshold {
+			is log-level-at-least($level, $threshold), $i >= $j,
+				"log-level-at-least($level, $threshold) == " ~ ($i >= $j);
+		}
+	}
+	is log-level-at-least('bogus', 'warning'), False, 'Unknown level fails closed';
+	is log-level-at-least('warning', 'bogus'), False, 'Unknown threshold fails closed';
+	is log-level-at-least('bogus', 'also-bogus'), False, 'Both unknown fails closed';
 };
 
 done-testing;

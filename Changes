@@ -2,6 +2,51 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.3.0  2026-08-07T12:10:18+01:00
+    - Toolkit system: new MCP::Server::Toolkit role plus
+      $server.plug($kit, :prefix<...>) and the MCP::Server::Registrar facade.
+      Prefixed tools and prompts become "prefix_name"; prefixed resource URIs
+      become "scheme://prefix/path".
+    - Tool groups now join the prefix and the name with "_" rather than "/", so
+      generated names stay inside the MCP tool-name charset. This is a breaking
+      change: tool-group 'file' now registers file_read, not file/read.
+      ToolGroup remains available as an alias of MCP::Server::Registrar.
+    - Duplicate tool names, duplicate prompt names and duplicate resource URIs
+      now die instead of silently overwriting, as do tool names outside
+      [A-Za-z0-9_-] or longer than 128 characters.
+    - MCP::Server.new(:tools[...]) loads toolkits by name (bare names resolve
+      under MCP::Server::Tool::), by instance, or as name => config pairs;
+      MCP::Server.from-config($path) builds an entire server from a JSON file.
+    - New raku-mcp command (MCP::Server::CLI) supporting --config, repeatable
+      --tool, --describe and --help.
+    - mcp classes (MCP::Server::DSL) are now toolkits themselves and can be
+      plugged into a larger server; their .server is private and built lazily.
+    - Dual-era MCP protocol support: both the 2025-11-25 (legacy) and
+      2026-07-28 (modern) protocol versions are served side by side, with the
+      era auto-detected per message -- no constructor flag required.
+    - server/discover is now a mandatory method in the modern era.
+    - Modern-era results carry a resultType, a _meta block with serverInfo,
+      and ttlMs/cacheScope cache metadata on tools/resources/prompts list and
+      resource read results.
+    - New JSON-RPC error codes -32020, -32021 and -32022 for modern-era
+      protocol violations.
+    - Per-request _meta logLevel replaces the logging capability in the
+      modern era; logging/setLevel is now actually implemented for legacy
+      clients (previously a stub).
+    - tools/resources/prompts list results are now returned in a
+      deterministic order.
+    - New MCP::Server::HTTP transport (Cro::HTTP-based Streamable HTTP,
+      modern-era only) answers each request with either a JSON body or a
+      per-request SSE stream, validates the Origin header, and exposes a
+      routes embedding hook for mounting inside a larger Cro app. raku-mcp
+      gained --http, --host, --http-path and --allow-origin flags plus a
+      matching "http" config-file section.
+    - New MCP::Server.new options :protocol-versions, :discovery-ttl-ms and
+      :cache-scope, plus per-resource :ttl-ms and :cache-scope.
+    - New transport-facing API: handle-modern-request, server-info,
+      discovery-document and modern-protocol-versions.
+    - New dependencies: Cro::HTTP and MIME::Base64.
+
 0.2.0  2026-06-22T23:32:43+01:00
     - execute-tool-calls now accepts function arguments supplied as
       either a JSON string or an associative object, and returns an

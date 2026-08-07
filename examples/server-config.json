@@ -1,0 +1,19 @@
+{
+  "name": "toolkit-server",
+  "version": "1.0",
+  "instructions": "Combines a file system pack, a shell pack, and a second aliased file system pack under a different root.",
+  "tools": {
+    "FileSystem": {
+      "root": "/data",
+      "prefix": "fs"
+    },
+    "FileSystem#docs": {
+      "root": "/data/docs",
+      "prefix": "docs"
+    },
+    "Shell": {
+      "allow": ["git"],
+      "prefix": "sh"
+    }
+  }
+}

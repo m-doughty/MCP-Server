@@ -79,7 +79,7 @@ subtest 'Tool call — handler error' => {
 	ok %resp<result><content>[0]<text>.contains('intentional'), 'Error message in content';
 };
 
-subtest 'Tool group with / prefix' => {
+subtest 'Tool group with _ prefix' => {
 	plan 3;
 	my $gs = MCP::Server.new(:name<group-test>);
 	$gs.tool-group: 'file', -> $g {
@@ -90,10 +90,10 @@ subtest 'Tool group with / prefix' => {
 		jsonrpc => '2.0', id => 10, method => 'tools/list',
 	});
 	is %resp<result><tools>.elems, 2, 'Two grouped tools';
-	ok %resp<result><tools>.first(*<name> eq 'file/read').defined, 'file/read registered';
+	ok %resp<result><tools>.first(*<name> eq 'file_read').defined, 'file_read registered';
 	my %call = $gs.handle-request({
 		jsonrpc => '2.0', id => 11, method => 'tools/call',
-		params => { name => 'file/list', arguments => {} },
+		params => { name => 'file_list', arguments => {} },
 	});
 	is %call<result><content>[0]<text>, 'dir listing', 'Grouped tool callable';
 };

@@ -1,0 +1,307 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MIME::Base64;
+use MCP::Server::Protocol;
+use MCP::Server::HTTP::Validation;
+
+plan 12;
+
+subtest 'encode-header-value / decode-header-value: sentinel roundtrips' => {
+	plan 14;
+
+	is encode-header-value('plain-ascii'), 'plain-ascii', 'Header-safe ASCII passes through unchanged';
+	is decode-header-value('plain-ascii'), 'plain-ascii', 'A non-sentinel value decodes verbatim';
+
+	my $utf8 = 'hello 🎉 שלום'; # emoji + RTL Hebrew text
+	my $utf8-encoded = encode-header-value($utf8);
+	ok $utf8-encoded.starts-with('=?base64?'), 'Non-ASCII text forces base64 sentinel encoding';
+	is decode-header-value($utf8-encoded), $utf8, 'UTF-8 sentinel roundtrips back to the original text';
+
+	my $leading = ' leading-space';
+	my $leading-encoded = encode-header-value($leading);
+	ok $leading-encoded.starts-with('=?base64?'), 'Leading whitespace forces sentinel encoding';
+	is decode-header-value($leading-encoded), $leading, 'Leading-space value roundtrips';
+
+	my $trailing = 'trailing-space ';
+	my $trailing-encoded = encode-header-value($trailing);
+	ok $trailing-encoded.starts-with('=?base64?'), 'Trailing whitespace forces sentinel encoding';
+	is decode-header-value($trailing-encoded), $trailing, 'Trailing-space value roundtrips';
+
+	my $newline = "embedded\nnewline";
+	my $newline-encoded = encode-header-value($newline);
+	ok $newline-encoded.starts-with('=?base64?'), 'An embedded newline forces sentinel encoding';
+	is decode-header-value($newline-encoded), $newline, 'Embedded-newline value roundtrips';
+
+	# A plain value that already *looks* like a sentinel must still be encoded --
+	# otherwise it would be ambiguous with a real sentinel on decode.
+	my $look-alike = '=?base64?xyz?=';
+	my $look-alike-encoded = encode-header-value($look-alike);
+	isnt $look-alike-encoded, $look-alike, 'A sentinel-shaped plain value is re-encoded, not passed through';
+	is decode-header-value($look-alike-encoded), $look-alike, 'The re-encoded look-alike roundtrips to its literal text';
+
+	# Markers are case-sensitive and lowercase-only.
+	is decode-header-value('=?BASE64?aGVsbG8=?='), '=?BASE64?aGVsbG8=?=',
+		'Uppercase =?BASE64?...?= is not a sentinel and decodes verbatim';
+
+	my $malformed = decode-header-value('=?base64?not-valid-base64!?=');
+	nok $malformed.defined, 'A malformed base64 payload decodes to an undefined Failure';
+};
+
+subtest 'decode-header-value: malformed UTF-8 inside a well-formed base64 payload' => {
+	plan 1;
+	my $payload = MIME::Base64.encode(Buf.new(0xFF, 0xFE), :oneline);
+	my $bad-utf8 = decode-header-value("=?base64?{$payload}?=");
+	nok $bad-utf8.defined, 'Valid base64 that decodes to invalid UTF-8 is a Failure';
+};
+
+sub tools-call-msg(%overrides = {}) {
+	my %msg = jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => {
+			name      => 'greet',
+			arguments => { count => 42, active => True, label => 'hi' },
+			_meta     => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		};
+	%msg{$_} = %overrides{$_} for %overrides.keys;
+	%msg;
+}
+
+sub base-headers(--> Hash) {
+	{
+		'mcp-method'           => 'tools/call',
+		'mcp-protocol-version' => MODERN-PROTOCOL-VERSION,
+		'mcp-name'             => 'greet',
+	};
+}
+
+subtest 'header-checks: Mcp-Method' => {
+	plan 3;
+	my %msg = tools-call-msg();
+
+	my %ok = base-headers();
+	nok header-checks(%ok, %msg).defined, 'Matching Mcp-Method passes';
+
+	my %mismatch = base-headers();
+	%mismatch<mcp-method> = 'tools/list';
+	my $err = header-checks(%mismatch, %msg);
+	is $err<code>, HEADER_MISMATCH, 'Mismatched Mcp-Method is a -32020 header mismatch';
+
+	my %missing = base-headers();
+	%missing<mcp-method>:delete;
+	is header-checks(%missing, %msg)<status>, 400, 'Missing Mcp-Method is a 400';
+};
+
+subtest 'header-checks: MCP-Protocol-Version' => {
+	plan 4;
+	my %msg = tools-call-msg();
+
+	my %ok = base-headers();
+	nok header-checks(%ok, %msg).defined, 'Matching protocol version passes';
+
+	my %missing-header = base-headers();
+	%missing-header<mcp-protocol-version>:delete;
+	is header-checks(%missing-header, %msg)<code>, HEADER_MISMATCH, 'Missing version header is a mismatch';
+
+	my %missing-meta = base-headers();
+	my %msg-no-meta = tools-call-msg();
+	%msg-no-meta<params><_meta>:delete;
+	is header-checks(%missing-meta, %msg-no-meta)<code>, HEADER_MISMATCH,
+		'Missing body _meta version counts as a mismatch';
+
+	my %wrong-version = base-headers();
+	%wrong-version<mcp-protocol-version> = '2025-11-25';
+	is header-checks(%wrong-version, %msg)<code>, HEADER_MISMATCH,
+		'A header version that disagrees with the body _meta is a mismatch';
+};
+
+subtest 'header-checks: MCP-Protocol-Version -- server/discover bootstrap-probe exemption' => {
+	plan 3;
+
+	# discover is the mandatory bootstrap probe: MCP::Server's core dispatch
+	# deliberately answers it without gating on a protocol version, since a
+	# client probing an unknown server cannot know what version to claim
+	# before it has heard back. Absent body _meta must therefore pass here,
+	# even though the header itself is still required (enforced elsewhere).
+	my %discover-msg = jsonrpc => '2.0', id => 5, method => 'server/discover', params => {};
+	my %discover-headers = 'mcp-method' => 'server/discover', 'mcp-protocol-version' => MODERN-PROTOCOL-VERSION;
+	nok header-checks(%discover-headers, %discover-msg).defined,
+		'server/discover with no body _meta version passes -- it is the version-free bootstrap probe';
+
+	my %discover-with-meta = jsonrpc => '2.0', id => 5, method => 'server/discover',
+		params => { _meta => { (META-PROTOCOL-VERSION) => '2025-11-25' } };
+	is header-checks(%discover-headers, %discover-with-meta)<code>, HEADER_MISMATCH,
+		'server/discover with a body _meta version that disagrees with the header is still a mismatch';
+
+	my %list-msg = jsonrpc => '2.0', id => 6, method => 'tools/list', params => {};
+	my %list-headers = 'mcp-method' => 'tools/list', 'mcp-protocol-version' => MODERN-PROTOCOL-VERSION;
+	is header-checks(%list-headers, %list-msg)<code>, HEADER_MISMATCH,
+		'A non-discover method with no body _meta version is still a mismatch (unchanged)';
+};
+
+subtest 'header-checks: Mcp-Name required for tools/call, resources/read, prompts/get' => {
+	plan 10;
+
+	my %tools-msg = tools-call-msg();
+	my %tools-ok = base-headers();
+	nok header-checks(%tools-ok, %tools-msg).defined, 'tools/call: matching Mcp-Name passes';
+	my %tools-missing = base-headers();
+	%tools-missing<mcp-name>:delete;
+	is header-checks(%tools-missing, %tools-msg)<code>, HEADER_MISMATCH, 'tools/call: missing Mcp-Name is required';
+	my %tools-mismatch = base-headers();
+	%tools-mismatch<mcp-name> = 'other-tool';
+	is header-checks(%tools-mismatch, %tools-msg)<code>, HEADER_MISMATCH, 'tools/call: mismatched Mcp-Name fails';
+	my %tools-base64 = base-headers();
+	%tools-base64<mcp-name> = encode-header-value('greet');
+	nok header-checks(%tools-base64, %tools-msg).defined, 'tools/call: sentinel-encoded Mcp-Name matches after decode';
+
+	my %read-msg = jsonrpc => '2.0', id => 2, method => 'resources/read',
+		params => { uri => 'file:///a.txt', _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+	my %read-ok = 'mcp-method' => 'resources/read', 'mcp-protocol-version' => MODERN-PROTOCOL-VERSION,
+		'mcp-name' => 'file:///a.txt';
+	nok header-checks(%read-ok, %read-msg).defined, 'resources/read: matching Mcp-Name (uri) passes';
+	my %read-missing = %read-ok;
+	%read-missing<mcp-name>:delete;
+	is header-checks(%read-missing, %read-msg)<code>, HEADER_MISMATCH, 'resources/read: missing Mcp-Name is required';
+	my %read-mismatch = %read-ok;
+	%read-mismatch<mcp-name> = 'file:///other.txt';
+	is header-checks(%read-mismatch, %read-msg)<code>, HEADER_MISMATCH, 'resources/read: mismatched Mcp-Name fails';
+
+	my %prompt-msg = jsonrpc => '2.0', id => 3, method => 'prompts/get',
+		params => { name => 'welcome', _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+	my %prompt-ok = 'mcp-method' => 'prompts/get', 'mcp-protocol-version' => MODERN-PROTOCOL-VERSION,
+		'mcp-name' => 'welcome';
+	nok header-checks(%prompt-ok, %prompt-msg).defined, 'prompts/get: matching Mcp-Name passes';
+	my %prompt-missing = %prompt-ok;
+	%prompt-missing<mcp-name>:delete;
+	is header-checks(%prompt-missing, %prompt-msg)<code>, HEADER_MISMATCH, 'prompts/get: missing Mcp-Name is required';
+	my %prompt-mismatch = %prompt-ok;
+	%prompt-mismatch<mcp-name> = 'other-prompt';
+	is header-checks(%prompt-mismatch, %prompt-msg)<code>, HEADER_MISMATCH, 'prompts/get: mismatched Mcp-Name fails';
+};
+
+subtest 'header-checks: Mcp-Name is ignored for other methods' => {
+	plan 2;
+	my %list-msg = jsonrpc => '2.0', id => 4, method => 'tools/list',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+	my %no-name = 'mcp-method' => 'tools/list', 'mcp-protocol-version' => MODERN-PROTOCOL-VERSION;
+	nok header-checks(%no-name, %list-msg).defined, 'tools/list: absent Mcp-Name is fine (not required)';
+
+	my %wrong-name = %no-name;
+	%wrong-name<mcp-name> = 'anything-at-all';
+	nok header-checks(%wrong-name, %list-msg).defined, 'tools/list: a present-but-irrelevant Mcp-Name is ignored';
+};
+
+subtest 'header-checks: Mcp-Param-* recognized (string, numeric, boolean)' => {
+	plan 6;
+	my %msg = tools-call-msg();
+
+	my %string-match = base-headers();
+	%string-match<mcp-param-label> = 'hi';
+	nok header-checks(%string-match, %msg).defined, 'Recognized string param matches';
+
+	my %string-mismatch = base-headers();
+	%string-mismatch<mcp-param-label> = 'bye';
+	is header-checks(%string-mismatch, %msg)<code>, HEADER_MISMATCH, 'Recognized string param mismatch fails';
+
+	my %numeric-match = base-headers();
+	%numeric-match<mcp-param-count> = '42'; # header '42' vs body Int 42 -- numeric equality
+	nok header-checks(%numeric-match, %msg).defined, 'Recognized numeric param matches numerically';
+
+	my %numeric-mismatch = base-headers();
+	%numeric-mismatch<mcp-param-count> = '43';
+	is header-checks(%numeric-mismatch, %msg)<code>, HEADER_MISMATCH, 'Recognized numeric param mismatch fails';
+
+	my %bool-match = base-headers();
+	%bool-match<mcp-param-active> = 'true';
+	nok header-checks(%bool-match, %msg).defined, 'Recognized boolean param matches';
+
+	my %bool-mismatch = base-headers();
+	%bool-mismatch<mcp-param-active> = 'false';
+	is header-checks(%bool-mismatch, %msg)<code>, HEADER_MISMATCH, 'Recognized boolean param mismatch fails';
+};
+
+subtest 'header-checks: Mcp-Param-* edge cases' => {
+	plan 4;
+	my %msg = tools-call-msg();
+
+	my %unrecognized = base-headers();
+	%unrecognized<mcp-param-not-an-argument> = 'anything';
+	nok header-checks(%unrecognized, %msg).defined, 'An unrecognized Mcp-Param-* header is ignored';
+
+	my %msg-with-array = tools-call-msg({
+		params => {
+			name      => 'greet',
+			arguments => { count => 42, active => True, label => 'hi', tags => ['a', 'b'] },
+			_meta     => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		},
+	});
+	my %array-param = base-headers();
+	%array-param<mcp-param-tags> = 'a';
+	nok header-checks(%array-param, %msg-with-array).defined, 'A non-scalar (array) argument param header is ignored';
+
+	my %msg-with-hash = tools-call-msg({
+		params => {
+			name      => 'greet',
+			arguments => { count => 42, active => True, label => 'hi', meta => { nested => 1 } },
+			_meta     => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		},
+	});
+	my %hash-param = base-headers();
+	%hash-param<mcp-param-meta> = 'anything';
+	nok header-checks(%hash-param, %msg-with-hash).defined, 'A non-scalar (hash) argument param header is ignored';
+
+	my %stray = base-headers();
+	%stray<mcp-session-id> = 'session-123';
+	%stray<last-event-id> = '17';
+	nok header-checks(%stray, %msg).defined, 'Mcp-Session-Id and Last-Event-ID are ignored entirely';
+};
+
+subtest 'origin-allowed: policy matrix' => {
+	plan 11;
+
+	ok origin-allowed(Str, :allow-no-origin(True)), 'Absent Origin allowed when allow-no-origin is True';
+	nok origin-allowed(Str, :allow-no-origin(False)), 'Absent Origin rejected when allow-no-origin is False';
+
+	ok origin-allowed('http://localhost'), 'http://localhost is always allowed';
+	ok origin-allowed('https://localhost:3000'), 'https://localhost with a port is always allowed';
+	ok origin-allowed('http://127.0.0.1:8080'), '127.0.0.1 with a port is always allowed';
+	ok origin-allowed('https://[::1]:9999'), '[::1] with a port is always allowed';
+
+	nok origin-allowed('https://evil.com'), 'A foreign origin with no allow-list is rejected';
+
+	ok origin-allowed('https://trusted.example', :allowed(['https://trusted.example'])),
+		'A foreign origin matching a Str allow-list entry is allowed';
+	nok origin-allowed('https://untrusted.example', :allowed(['https://trusted.example'])),
+		'A foreign origin not matching any Str allow-list entry is rejected';
+
+	ok origin-allowed('https://api.trusted.example', :allowed([/ '.trusted.example' $ /])),
+		'A foreign origin matching a Regex allow-list entry is allowed';
+	nok origin-allowed('https://evil.com', :allowed([/ '.trusted.example' $ /])),
+		'A foreign origin not matching any Regex allow-list entry is rejected';
+};
+
+subtest 'sse-event: SSE framing' => {
+	plan 4;
+	my %msg = jsonrpc => '2.0', id => 1, result => {};
+	my $event = sse-event(%msg);
+	ok $event.starts-with('data: '), 'Event text begins with the data: prefix';
+	ok $event.ends-with("\n\n"), 'Event text is terminated by a blank line';
+	is $event, 'data: ' ~ to-json(%msg, :!pretty) ~ "\n\n",
+		'Event text is exactly "data: <json>\n\n"';
+
+	# to-json(:!pretty) escapes embedded newlines inside string values (they become the
+	# two characters \ and n, never a raw newline), so a value containing a literal
+	# newline still round-trips through sse-event as a single "data: " line -- this
+	# exercises the defensive split() without relying on to-json ever emitting a real
+	# multi-line document.
+	my $multi-line-value = sse-event({ text => "line1\nline2" });
+	my @data-lines = $multi-line-value.split("\n").grep({ .starts-with('data:') });
+	is @data-lines.elems, 1, 'An escaped embedded newline does not fool the defensive line split';
+};
+
+subtest 'sse-comment: keep-alive framing' => {
+	plan 1;
+	is sse-comment(), ":\n\n", 'sse-comment is a bare SSE comment keep-alive';
+};
+
+done-testing;

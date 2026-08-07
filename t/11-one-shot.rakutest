@@ -1,0 +1,146 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+# NB: MCP::Server is deliberately `use`d before any toolkit is `require`d at
+# runtime — that combination is what breaks a bare ::('...') lookup after
+# require, so this file is the regression guard for the bound-require loader.
+use MCP::Server;
+
+plan 8;
+
+sub dies-with(&code, Str:D $needle, Str:D $desc) {
+	my Str $msg;
+	{
+		code();
+		CATCH { default { $msg = .message } }
+	}
+	my $matched = $msg.defined && $msg.contains($needle);
+	ok $matched, $desc;
+	diag "message was: {$msg // '(nothing thrown)'}" unless $matched;
+}
+
+sub tool-names($server) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 99, method => 'tools/list',
+	})<result><tools>.map(*<name>).sort.list;
+}
+
+subtest 'Bare name resolves under MCP::Server::Tool::' => {
+	plan 2;
+	my $server = MCP::Server.new(:name<one-shot>, :tools['TestKit',]);
+	is-deeply tool-names($server), ('greet',), 'Toolkit loaded and registered';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'greet', arguments => { name => 'Ada' } },
+	});
+	is %call<result><content>[0]<text>, 'Hello, Ada', 'Loaded tool is callable';
+};
+
+subtest 'Qualified name is used verbatim' => {
+	plan 1;
+	my $server = MCP::Server.new(
+		:name<one-shot>,
+		:tools['MCP::Server::Tool::TestKit',],
+	);
+	is-deeply tool-names($server), ('greet',), 'Fully qualified toolkit loaded';
+};
+
+subtest 'Pair entry passes config through' => {
+	plan 2;
+	my $server = MCP::Server.new(
+		:name<one-shot>,
+		:tools['TestKit' => { greeting => 'Yo' },],
+	);
+	is-deeply tool-names($server), ('greet',), 'Configured toolkit registered';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'greet', arguments => { name => 'Bob' } },
+	});
+	is %call<result><content>[0]<text>, 'Yo, Bob', 'Config reached the handler';
+};
+
+subtest 'Reserved prefix key namespaces the entry' => {
+	plan 3;
+	my $server = MCP::Server.new(
+		:name<one-shot>,
+		:tools[
+			'TestKit' => { greeting => 'Hi', prefix => 'a' },
+			'TestKit' => { greeting => 'Ho', prefix => 'b' },
+		],
+	);
+	is-deeply tool-names($server), ('a_greet', 'b_greet'), 'Same toolkit twice under two prefixes';
+
+	my %a = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'a_greet', arguments => { name => 'X' } },
+	});
+	is %a<result><content>[0]<text>, 'Hi, X', 'First instance keeps its own config';
+
+	my %b = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => { name => 'b_greet', arguments => { name => 'X' } },
+	});
+	is %b<result><content>[0]<text>, 'Ho, X', 'Second instance keeps its own config';
+};
+
+subtest 'Instance entries' => {
+	plan 2;
+	my \kit = MCP::Server::load-toolkit-class('TestKit');
+	my $server = MCP::Server.new(
+		:name<one-shot>,
+		:tools[
+			kit.new(:greeting<Hey>),
+			kit.new(:greeting<Hey>) => { prefix => 'extra' },
+		],
+	);
+	is-deeply tool-names($server), ('extra_greet', 'greet'), 'Instance and prefixed instance';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'extra_greet', arguments => { name => 'Y' } },
+	});
+	is %call<result><content>[0]<text>, 'Hey, Y', 'Prefixed instance callable';
+};
+
+subtest 'Unknown module' => {
+	plan 1;
+	dies-with { MCP::Server.new(:name<one-shot>, :tools['NoSuchKit',]) },
+		'zef install MCP::Server::Tool::NoSuchKit',
+		'Missing toolkit dies with an install hint';
+};
+
+subtest 'Config errors propagate from from-config' => {
+	plan 3;
+	dies-with { MCP::Server.new(:name<one-shot>, :tools['TestKit' => { greetng => 'typo' },]) },
+		'Unknown config key(s)', 'Bad config key propagates';
+
+	dies-with { MCP::Server.new(:name<one-shot>, :tools['StrictKit',]) },
+		'Missing required config key(s)', 'Missing required setting propagates';
+
+	dies-with {
+		MCP::Server.new(
+			:name<one-shot>,
+			:tools[MCP::Server::load-toolkit-class('TestKit').new => { greeting => 'x' },],
+		);
+	},
+		"only the reserved 'prefix' key",
+		'Config beside an instance entry is rejected';
+};
+
+subtest 'Invalid entries' => {
+	plan 2;
+	dies-with { MCP::Server.new(:name<one-shot>, :tools[42,]) },
+		'Invalid :tools entry', 'Non-toolkit entry dies';
+
+	dies-with {
+		MCP::Server.new(
+			:name<one-shot>,
+			:tools['TestKit' => { prefix => 7 },],
+		);
+	},
+		'prefix must be a string', 'Non-string prefix dies';
+};
+
+done-testing;

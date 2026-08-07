@@ -1,0 +1,212 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+
+plan 7;
+
+#| Stand-in for $*ERR so handler log lines stay out of the test output.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+my $ran = 0;
+
+my $server = MCP::Server.new(:name<iface>, :version<3.1.4>, :instructions('Read me'));
+
+$server.tool: 'echo', :handler(-> :%args {
+	$ran++;
+	$server.log('info', "echo {%args<tag> // ''}");
+	"echo {%args<tag> // ''}";
+});
+
+$server.tool: 'cancel-check', :handler(-> :%args {
+	$*MCP-REQUEST-CONTEXT.cancelled ?? 'cancelled' !! 'live';
+});
+
+$server.resource: 'mem://doc', :name<doc>, :handler(-> :%args { 'body' });
+
+sub modern-call($id, Str :$tag = '', Str :$log-level --> Hash) {
+	my %meta = (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION;
+	%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+	{
+		jsonrpc => '2.0', :$id, method => 'tools/call',
+		params => { name => 'echo', arguments => { :$tag }, _meta => %meta },
+	};
+}
+
+subtest 'The era is forced, not detected' => {
+	plan 6;
+
+	my %bare = $server.handle-modern-request({ jsonrpc => '2.0', id => 1, method => 'tools/list' });
+	is %bare<error><code>, UNSUPPORTED_PROTOCOL_VERSION,
+		'A request with no _meta version is rejected rather than treated as legacy';
+
+	for <initialize ping logging/setLevel> -> $method {
+		my %resp = $server.handle-modern-request({
+			jsonrpc => '2.0', id => 2, :$method, params => { level => 'debug' },
+		});
+		is %resp<error><code>, METHOD_NOT_FOUND, "$method does not exist for a modern transport";
+	}
+
+	my %discover = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 3, method => 'server/discover',
+	});
+	is %discover<result><supportedVersions>[0], MODERN-PROTOCOL-VERSION,
+		'server/discover answers without _meta';
+
+	my %legacy-init = $server.handle-request({
+		jsonrpc => '2.0', id => 4, method => 'initialize', params => {},
+	});
+	is %legacy-init<result><protocolVersion>, LEGACY-PROTOCOL-VERSION,
+		'The legacy entry point is unaffected by the forced-modern calls';
+};
+
+subtest 'Notification bodies get an empty answer' => {
+	plan 3;
+
+	$ran = 0;
+	my $*ERR = ErrSink.new;
+	my %notif = modern-call(Nil);
+	%notif<id>:delete;
+	my %resp = $server.handle-modern-request(%notif);
+	is-deeply %resp, {}, 'A body with no id produces no response at all';
+	is $ran, 1, 'The notification was still dispatched';
+
+	my %cancelled = $server.handle-modern-request({
+		jsonrpc => '2.0', method => 'notifications/cancelled',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	});
+	is-deeply %cancelled, {}, 'An unknown notification is swallowed rather than answered';
+};
+
+subtest 'Malformed and unknown bodies' => {
+	plan 6;
+
+	# A transport hands the core whatever the client sent, so every one of these
+	# has to come back as a JSON-RPC error rather than an exception.
+	my %bad-params = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list', params => 'not-an-object',
+	});
+	is %bad-params<error><code>, INVALID_PARAMS, 'Non-object params are rejected, not fatal';
+
+	my %bad-name = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 4, method => 'tools/call',
+		params => {
+			name => 42, arguments => {},
+			_meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		},
+	});
+	is %bad-name<error><code>, INVALID_PARAMS, 'A non-string tool name is just an unknown tool';
+
+	my %bad-args = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 5, method => 'tools/call',
+		params => {
+			name => 'echo', arguments => 'nope',
+			_meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		},
+	});
+	is %bad-args<error><code>, INVALID_PARAMS, 'Non-object tool arguments are rejected';
+
+	my %bad-uri = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 6, method => 'resources/read',
+		params => {
+			uri => { nested => 'object' },
+			_meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		},
+	});
+	is %bad-uri<error><code>, INVALID_PARAMS, 'A non-string resource uri is just an unknown resource';
+
+	my %unknown = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 2, method => 'nope/nope',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	});
+	is %unknown<error><code>, METHOD_NOT_FOUND, 'Unknown methods are -32601 (transports map that to 404)';
+
+	my %listen = $server.handle-modern-request({
+		jsonrpc => '2.0', id => 3, method => 'subscriptions/listen',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	});
+	is %listen<error><code>, METHOD_NOT_FOUND, 'subscriptions/listen is -32601 as well';
+};
+
+subtest 'Notifications without a sink are dropped' => {
+	plan 2;
+	my $*ERR = ErrSink.new;
+	my %resp = $server.handle-modern-request(modern-call(1, :tag<sinkless>, :log-level<debug>));
+	ok %resp<result><content>:exists, 'A logging handler without :&notify still returns its result';
+	is %resp<result><content>[0]<text>, 'echo sinkless', 'The result is intact';
+};
+
+subtest 'Cancellation is visible to handlers' => {
+	plan 3;
+
+	sub cancel-call($id, Promise :$cancelled --> Str) {
+		my %msg =
+			jsonrpc => '2.0', :$id, method => 'tools/call',
+			params => {
+				name => 'cancel-check', arguments => {},
+				_meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+			};
+		my %resp = $server.handle-modern-request(
+			%msg, |($cancelled.defined ?? (:$cancelled) !! ()),
+		);
+		%resp<result><content>[0]<text>;
+	}
+
+	is cancel-call(1), 'live', 'No cancellation promise means the request is live';
+
+	my $pending = Promise.new;
+	is cancel-call(2, :cancelled($pending)), 'live', 'An unkept promise means the request is live';
+
+	my $gone = Promise.new;
+	$gone.keep(True);
+	is cancel-call(3, :cancelled($gone)), 'cancelled', 'A kept promise tells the handler to give up';
+};
+
+subtest 'Accessors' => {
+	plan 6;
+
+	is-deeply $server.server-info, { name => 'iface', version => '3.1.4' }, 'server-info shape';
+	is-deeply $server.modern-protocol-versions, (MODERN-PROTOCOL-VERSION,).List,
+		'modern-protocol-versions is the configured set intersected with the modern era';
+
+	my %doc = $server.discovery-document;
+	is-deeply %doc<supportedVersions>.List, (MODERN-PROTOCOL-VERSION,).List,
+		'discovery-document reports the same versions';
+	is %doc<instructions>, 'Read me', 'discovery-document carries the instructions';
+	is %doc<ttlMs>, 3_600_000, 'discovery-document carries a TTL';
+	nok %doc<resultType>:exists,
+		"discovery-document is the bare body — framing and envelope are the dispatcher's job";
+};
+
+subtest 'Concurrent modern requests do not cross-talk' => {
+	plan 3;
+
+	my @results = await do for ^8 -> $i {
+		start {
+			my $*ERR = ErrSink.new;
+			my @notifs;
+			my %resp = $server.handle-modern-request(
+				modern-call(1000 + $i, :tag("t$i"), :log-level<debug>),
+				notify => -> %n { @notifs.push(%n) },
+			);
+			{
+				id => %resp<id>,
+				text => %resp<result><content>[0]<text>,
+				notified => @notifs.map({ $_<params><message> }).list,
+			};
+		}
+	}
+
+	is-deeply @results.map(*<id>).sort.List, (1000 .. 1007).List, 'Every request kept its own id';
+	is-deeply @results.sort(*<id>).map(*<text>).List, (^8).map({ "echo t$_" }).List,
+		'Every response carries its own result';
+	is-deeply @results.sort(*<id>).map(*<notified>).List, (^8).map({ ("echo t$_",) }).List,
+		"Every notification went to its own request's sink";
+};
+
+done-testing;

@@ -1,0 +1,4 @@
+#!/usr/bin/env raku
+use lib $?FILE.IO.resolve.parent.parent.add('lib').Str;
+use MCP::Server::CLI;
+exit MCP::Server::CLI::run(@*ARGS);

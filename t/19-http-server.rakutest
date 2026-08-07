@@ -1,0 +1,501 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use Cro::HTTP::Client;
+use MCP::Server;
+use MCP::Server::HTTP;
+use MCP::Server::HTTP::Validation;
+use MCP::Server::Protocol;
+
+plan 15;
+
+# Every await in this file goes through timed(), so a transport bug shows up as a
+# failing test rather than a CI job that never finishes.
+constant TIMEOUT = 30;
+
+#| Await $promise, giving up (loudly) rather than blocking forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise.result;
+}
+
+# === The server under test ===
+
+my $counter-lock = Lock.new;
+my $notification-calls = 0;
+
+my $server = MCP::Server.new(:name<http-test>, :version<9.9.9>);
+
+$server.tool: 'greet', :description('Greet somebody'),
+	:handler(-> :%args { "Hi, {%args<name> // 'you'}" });
+
+$server.tool: 'chatty', :handler(-> :%args {
+	$server.log('info', 'first');
+	$server.log('info', 'second');
+	'chattered';
+});
+
+$server.tool: 'echo-log', :handler(-> :%args {
+	my $tag = %args<tag> // '';
+	$server.log('info', "start $tag");
+	sleep 0.2;
+	$server.log('info', "end $tag");
+	"done $tag";
+});
+
+# Emits at once and then lingers, so a client has something to abandon
+# mid-stream.  Polling the cancellation flag is what a well-behaved handler does;
+# the server never interrupts one.
+$server.tool: 'slow', :handler(-> :%args {
+	$server.log('info', 'working');
+	for ^40 {
+		last if $*MCP-REQUEST-CONTEXT.cancelled;
+		sleep 0.05;
+	}
+	'eventually';
+});
+
+$server.tool: 'count', :handler(-> :%args {
+	$counter-lock.protect: { $notification-calls++ };
+	'counted';
+});
+
+# A non-ASCII URI cannot travel in a header as-is, so this is what exercises the
+# =?base64?...?= sentinel end to end.
+constant CAFE-URI = 'mem://café';
+$server.resource: CAFE-URI, :name<cafe>, :handler(-> :%args { 'espresso' });
+
+# === Booting ===
+
+#| Start the endpoint on a random high port, retrying a few times in case
+#| something else already owns the one we picked.  Cro cannot report the port an
+#| OS-assigned :port(0) landed on, so the port has to be chosen here, and a real
+#| request is the only honest proof that the listener is ours and working.
+sub boot(--> List) {
+	my $last-error;
+	for ^5 {
+		my $port = (20000 .. 40000).pick;
+		my $http = MCP::Server::HTTP.new(
+			:$server, :$port, allowed-origins => ['https://app.example',],
+		);
+		$http.start;
+
+		my %probe = jsonrpc => '2.0', id => 'probe', method => 'tools/list',
+			params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+		my $answered = Cro::HTTP::Client.new(:!persistent).post(
+			"http://127.0.0.1:$port/mcp",
+			content-type => 'application/json',
+			body => to-json(%probe, :!pretty),
+			headers => [
+				'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+				'Mcp-Method' => 'tools/list',
+			],
+		);
+		await Promise.anyof($answered, Promise.in(10));
+		return ($http, $port) if $answered.status === Kept;
+
+		$last-error = $answered.status === Broken ?? $answered.cause.message !! 'no answer';
+		try $http.stop;
+	}
+	die "Could not start the MCP HTTP endpoint on any of 5 random ports: $last-error";
+}
+
+my ($http, $port) = boot();
+LEAVE { try $http.stop }
+
+my $endpoint = "http://127.0.0.1:$port/mcp";
+
+# === Request helpers ===
+
+#| A modern-era request body: every 2026-07-28 message is self-describing, so the
+#| protocol version always travels in _meta.
+sub body($id, Str:D $method, %params = {}, Str :$log-level --> Hash) {
+	my %meta = (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION;
+	%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+
+	my %p = %params;
+	%p<_meta> = %meta;
+
+	my %msg = jsonrpc => '2.0', method => $method, params => %p;
+	%msg<id> = $id if $id.defined;
+	%msg;
+}
+
+#| The routing headers a well-formed request carries, derived from its body.
+sub headers-for(%msg --> List) {
+	my $name = (%msg<params><name> // %msg<params><uri>);
+	(
+		'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+		'Mcp-Method' => %msg<method>,
+		|($name.defined ?? ('Mcp-Name' => encode-header-value($name)) !! ()),
+	);
+}
+
+#| POST a raw body and hand back the response, error statuses included: the
+#| client turns 4xx and 5xx into exceptions, and every one of them is a case
+#| under test here.
+sub post-raw(Str:D $body, :@headers, Str :$content-type = 'application/json') {
+	my $client = Cro::HTTP::Client.new(:!persistent);
+	timed(
+		$client.post($endpoint, :$content-type, :$body, :@headers).then({
+			.status === Kept ?? .result !! do given .cause {
+				when X::Cro::HTTP::Error { .response }
+				default { .rethrow }
+			}
+		}),
+		"a response to POST $body",
+	);
+}
+
+#| POST a well-formed message with the headers it implies, plus any extras.
+sub post-msg(%msg, :@extra-headers, Str :$accept) {
+	post-raw(
+		to-json(%msg, :!pretty),
+		headers => [
+			|headers-for(%msg),
+			|@extra-headers,
+			|($accept.defined ?? ('Accept' => $accept) !! ()),
+		],
+	);
+}
+
+sub json-of($response) {
+	timed($response.body, 'a JSON response body');
+}
+
+#| Read an event stream to its close and return the decoded payload of every
+#| event.  Keepalive comments carry no data lines and drop out here.
+sub sse-events($response --> List) {
+	my $lock = Lock.new;
+	my $text = '';
+	my $closed = Promise.new;
+
+	my $tap = $response.body-byte-stream.tap(
+		-> $blob { $lock.protect: { $text ~= $blob.decode('utf-8') } },
+		done => { $closed.keep(True) },
+		quit => -> $error { $closed.break($error) },
+	);
+	timed($closed, 'the event stream to close');
+	$tap.close;
+
+	($lock.protect: { $text }).split("\n\n").grep(*.trim.chars > 0).map(-> $frame {
+		my @data = $frame.lines.grep(*.starts-with('data: ')).map(*.substr(6));
+		@data.elems > 0 ?? from-json(@data.join("\n")) !! Nil;
+	}).grep(*.defined).list;
+}
+
+# === Tests ===
+
+subtest 'A well-formed request is answered with one JSON object' => {
+	plan 5;
+
+	my $response = post-msg(body(1, 'tools/call', {
+		name => 'greet', arguments => { name => 'Ada' },
+	}));
+
+	is $response.status, 200, 'A successful call is 200';
+	like $response.header('Content-type'), /^ 'application/json' /, 'Answered as JSON';
+
+	my %body = json-of($response);
+	is %body<id>, 1, 'The response carries the request id';
+	is %body<result><content>[0]<text>, 'Hi, Ada', 'The handler ran';
+	is %body<result><_meta>{META-SERVER-INFO}<name>, 'http-test',
+		'The core envelope survives the transport untouched';
+};
+
+subtest 'A handler that logs upgrades the answer to an event stream' => {
+	plan 8;
+
+	my $response = post-msg(
+		body(2, 'tools/call', { name => 'chatty', arguments => {} }, :log-level<debug>),
+		accept => 'text/event-stream',
+	);
+
+	is $response.status, 200, 'The stream starts with a 200';
+	like $response.header('Content-type'), /^ 'text/event-stream' /, 'Answered as SSE';
+	is $response.header('X-Accel-Buffering'), 'no', 'Buffering proxies are told to stop';
+	is $response.header('Cache-Control'), 'no-store', 'A request-scoped stream is not cacheable';
+
+	my @events = sse-events($response);
+	is @events.elems, 3, 'Two notifications and the response, then the stream closes';
+	is-deeply @events[0 .. 1].map({ $_<params><message> }).List, ('first', 'second').List,
+		'The notifications arrive in the order the handler raised them';
+	is @events[2]<id>, 2, 'The response event comes last';
+	is @events[2]<result><content>[0]<text>, 'chattered', 'The response event carries the result';
+};
+
+subtest 'A stream-accepting request that hears nothing stays plain JSON' => {
+	plan 3;
+
+	my $response = post-msg(
+		body(3, 'tools/call', { name => 'greet', arguments => { name => 'Bo' } }, :log-level<debug>),
+		accept => 'text/event-stream, application/json',
+	);
+
+	is $response.status, 200, 'Still a 200';
+	like $response.header('Content-type'), /^ 'application/json' /,
+		'A silent handler is not worth a stream';
+	is json-of($response)<result><content>[0]<text>, 'Hi, Bo', 'The result came back whole';
+};
+
+subtest 'A notification body is acknowledged and nothing is sent back' => {
+	plan 3;
+
+	$counter-lock.protect: { $notification-calls = 0 };
+
+	my %msg = body(Nil, 'tools/call', { name => 'count', arguments => {} });
+	my $response = post-msg(%msg);
+
+	is $response.status, 202, 'JSON-RPC forbids a response, so the answer is a bare 202';
+	is timed($response.body-text, 'the 202 body'), '', 'No body at all';
+	is ($counter-lock.protect: { $notification-calls }), 1,
+		'The notification was still dispatched';
+};
+
+subtest 'Routing headers are validated against the body' => {
+	plan 7;
+
+	my %msg = body(4, 'tools/list');
+
+	my $mismatch = post-raw(to-json(%msg, :!pretty), headers => [
+		'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+		'Mcp-Method' => 'prompts/list',
+	]);
+	is $mismatch.status, 400, 'A header that disagrees with the body is a bad request';
+	is json-of($mismatch)<error><code>, HEADER_MISMATCH, '...reported as -32020';
+
+	my $missing = post-raw(to-json(%msg, :!pretty), headers => [
+		'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+	]);
+	is $missing.status, 400, 'A missing routing header is a bad request';
+	is json-of($missing)<error><code>, HEADER_MISMATCH, '...reported as -32020 as well';
+
+	my $version = post-raw(to-json(%msg, :!pretty), headers => [
+		'MCP-Protocol-Version' => '1999-01-01',
+		'Mcp-Method' => 'tools/list',
+	]);
+	is $version.status, 400, 'An unknown protocol version is a bad request';
+
+	my %error = json-of($version)<error>;
+	is %error<code>, UNSUPPORTED_PROTOCOL_VERSION, '...reported as -32022';
+	is-deeply %error<data><supported>.List, SUPPORTED-PROTOCOL-VERSIONS.List,
+		'...naming every version this server speaks, legacy included, so a client can fall back';
+};
+
+subtest 'server/discover answers a bare bootstrap probe with no body _meta' => {
+	plan 3;
+
+	# A client probing an unknown server cannot know what protocol version to
+	# claim in the body before it has heard back, so discover must work with
+	# routing headers alone and no _meta at all -- unlike every other method.
+	my %msg = jsonrpc => '2.0', id => 11, method => 'server/discover';
+	my $response = post-raw(to-json(%msg, :!pretty), headers => [
+		'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+		'Mcp-Method' => 'server/discover',
+	]);
+
+	is $response.status, 200, 'A bare discover POST is answered, not rejected as a header mismatch';
+	my %body = json-of($response);
+	is %body<id>, 11, 'The response carries the request id';
+	ok %body<result><supportedVersions>.defined, 'The result reports the versions this server speaks';
+};
+
+subtest 'Methods this server does not have are 404' => {
+	plan 4;
+
+	for <nope/nope subscriptions/listen> -> $method {
+		my $response = post-msg(body(5, $method));
+		is $response.status, 404, "$method is a 404";
+		is json-of($response)<error><code>, METHOD_NOT_FOUND, "$method is -32601";
+	}
+};
+
+subtest 'The endpoint is POST-only' => {
+	plan 4;
+
+	for <GET DELETE> -> $method {
+		my $client = Cro::HTTP::Client.new(:!persistent);
+		my $response = timed(
+			$client.request($method, $endpoint).then({
+				.status === Kept ?? .result !! do given .cause {
+					when X::Cro::HTTP::Error { .response }
+					default { .rethrow }
+				}
+			}),
+			"a response to $method",
+		);
+		is $response.status, 405, "$method is not allowed";
+		is $response.header('Allow'), 'POST', "$method is told what is";
+	}
+};
+
+subtest 'Origins are checked before anything else happens' => {
+	plan 3;
+
+	my %msg = body(6, 'tools/list');
+
+	my $blocked = post-msg(%msg, extra-headers => ['Origin' => 'https://evil.example',]);
+	is $blocked.status, 403, 'An unknown browser origin is refused';
+
+	my $allowed = post-msg(%msg, extra-headers => ['Origin' => 'https://app.example',]);
+	is $allowed.status, 200, 'A configured origin is let through';
+
+	my $loopback = post-msg(%msg, extra-headers => ['Origin' => 'http://localhost:3000',]);
+	is $loopback.status, 200, 'Loopback origins are always allowed';
+};
+
+subtest 'Bodies that are not a single JSON-RPC object' => {
+	plan 6;
+
+	my @routing =
+		'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+		'Mcp-Method' => 'tools/list';
+
+	my $broken = post-raw('{"jsonrpc": ', headers => @routing);
+	is $broken.status, 400, 'Unparseable JSON is a bad request';
+	is json-of($broken)<error><code>, PARSE_ERROR, '...reported as -32700';
+
+	my $batch = post-raw('[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]', headers => @routing);
+	is $batch.status, 400, 'A batch is a bad request';
+	is json-of($batch)<error><code>, INVALID_REQUEST,
+		'...reported as -32600 rather than mis-diagnosed as a parse error';
+
+	my $not-json = post-raw('{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+		headers => @routing, content-type => 'text/plain');
+	is $not-json.status, 415, 'A body that is not JSON is refused outright';
+
+	my $no-version = post-raw('{"id":1,"method":"tools/list"}', headers => @routing);
+	is json-of($no-version)<error><code>, INVALID_REQUEST,
+		'A body missing its jsonrpc marker gets the core parser\'s own error';
+};
+
+subtest 'Header values may use the base64 sentinel' => {
+	plan 3;
+
+	my %msg = body(7, 'resources/read', { uri => CAFE-URI });
+	my @headers = headers-for(%msg);
+
+	ok @headers.first(*.key eq 'Mcp-Name').value.starts-with('=?base64?'),
+		'A non-ASCII resource URI cannot travel as-is, so it is sentinel-encoded';
+
+	my $response = post-raw(to-json(%msg, :!pretty), :@headers);
+	is $response.status, 200, 'The decoded header matches the body';
+	is json-of($response)<result><contents>[0]<text>, 'espresso', 'The resource was read';
+};
+
+subtest 'Stray session headers are ignored' => {
+	plan 2;
+
+	# Neither header exists in this era; a client carrying them over from an older
+	# implementation must not be punished for it (RFC 9110: ignore what you do not
+	# recognise).
+	my $response = post-msg(
+		body(8, 'tools/call', { name => 'greet', arguments => { name => 'Cy' } }),
+		extra-headers => [
+			'Mcp-Session-Id' => 'left-over-session',
+			'Last-Event-ID'  => '42',
+		],
+	);
+
+	is $response.status, 200, 'Stray Streamable HTTP session headers change nothing';
+	is json-of($response)<result><content>[0]<text>, 'Hi, Cy', 'The call went through';
+};
+
+subtest 'Concurrent streams do not cross-talk' => {
+	plan 6;
+
+	my @work = do for <a b> -> $tag {
+		start {
+			my $response = post-msg(
+				body("id-$tag", 'tools/call', {
+					name => 'echo-log', arguments => { tag => $tag },
+				}, :log-level<debug>),
+				accept => 'text/event-stream',
+			);
+			{ tag => $tag, events => sse-events($response) };
+		}
+	}
+
+	timed(Promise.allof(@work), 'both event streams');
+
+	for @work.map(*.result) -> %stream {
+		my $tag = %stream<tag>;
+		# .List, not a bare assignment: the hash value is itemized, and the
+		# single-argument rule would otherwise make it one element.
+		my @events = %stream<events>.List;
+		is @events.elems, 3, "Stream $tag saw exactly its own two notifications and response";
+		is-deeply @events[0 .. 1].map({ $_<params><message> }).List,
+			("start $tag", "end $tag").List,
+			"Stream $tag saw nobody else's notifications";
+		is @events[2]<id>, "id-$tag", "Stream $tag ends with its own response";
+	}
+};
+
+subtest 'A client abandoning a stream does not take the server with it' => {
+	plan 2;
+
+	my %msg = body(9, 'tools/call', { name => 'slow', arguments => {} }, :log-level<debug>);
+	my $json = to-json(%msg, :!pretty);
+
+	# Cro's client only closes its end of the pipeline, which the server never
+	# notices; a raw socket is the only way to hang up mid-stream for real.
+	my $conn = timed(IO::Socket::Async.connect('127.0.0.1', $port), 'a raw connection');
+	my $first-bytes = Promise.new;
+	my $tap = $conn.Supply(:bin).tap({ $first-bytes.keep(True) if $first-bytes.status === Planned });
+
+	timed($conn.print(
+		"POST /mcp HTTP/1.1\r\n"
+		~ "Host: 127.0.0.1:$port\r\n"
+		~ "Content-Type: application/json\r\n"
+		~ "Accept: text/event-stream\r\n"
+		~ "MCP-Protocol-Version: {MODERN-PROTOCOL-VERSION}\r\n"
+		~ "Mcp-Method: tools/call\r\n"
+		~ "Mcp-Name: slow\r\n"
+		~ "Content-Length: {$json.encode('utf-8').bytes}\r\n"
+		~ "\r\n$json"
+	), 'the raw request to go out');
+
+	timed($first-bytes, 'the first bytes of the stream');
+	pass 'The stream started';
+	$tap.close;
+	$conn.close;
+
+	my $after = post-msg(body(10, 'tools/call', { name => 'greet', arguments => { name => 'Di' } }));
+	is $after.status, 200, 'The endpoint is still serving afterwards';
+};
+
+subtest 'The transport refuses settings it cannot honour' => {
+	plan 7;
+
+	my sub dies-with(&code, Str:D $needle, Str:D $desc) {
+		my Str $message;
+		{
+			code();
+			CATCH { default { $message = .message } }
+		}
+		my $matched = ($message // '').contains($needle);
+		ok $matched, $desc;
+		diag "message was: {$message // '(nothing thrown)'}" unless $matched;
+	}
+
+	dies-with { MCP::Server::HTTP.new(:$server, :port(0)) },
+		'port must be between 1 and 65535', 'Port 0 is refused rather than silently rebound';
+	dies-with { MCP::Server::HTTP.new(:$server, :port(70_000)) },
+		'port must be between 1 and 65535', 'An out-of-range port is refused';
+	dies-with { MCP::Server::HTTP.new(:$server, :keepalive(0)) },
+		'keepalive must be greater than zero', 'A zero keepalive would busy-loop, so it is refused';
+	dies-with { MCP::Server::HTTP.new(:$server, allowed-origins => [42,]) },
+		'Allowed origins must be strings or regexes', 'Origins have to be matchable';
+	dies-with { $http.start },
+		'is already running', 'One instance means one listener';
+
+	my $configured = MCP::Server::HTTP.new(:$server, :port(8080), :path('/api/mcp/'));
+	is $configured.endpoint, 'http://127.0.0.1:8080/api/mcp',
+		'Surrounding slashes are normalised away, multi-segment paths are kept';
+
+	ok MCP::Server::HTTP.new(:$server, allowed-origins => [/^ 'https://' \w+ '.example' $/,]).defined,
+		'A regex origin is accepted';
+};
+
+done-testing;

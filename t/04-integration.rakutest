@@ -2,8 +2,9 @@ use Test;
 use lib 'lib';
 use JSON::Fast;
 use MCP::Server;
+use MCP::Server::Protocol;
 
-plan 5;
+plan 7;
 
 my $server = MCP::Server.new(:name<test-server>, :version<0.1.0>, :instructions('A test server'));
 
@@ -66,6 +67,45 @@ subtest 'Prompt get' => {
 		params => { name => 'review', arguments => { code => 'fn main() {}' } },
 	});
 	ok %resp<result><messages>[0]<content><text>.contains('fn main'), 'Prompt includes code';
+};
+
+subtest 'Both eras on one server instance' => {
+	plan 6;
+	# The era is a property of each message, so a legacy session and a modern
+	# stateless request can be interleaved on the same instance.
+	my %init = $server.handle-request({
+		jsonrpc => '2.0', id => 10, method => 'initialize', params => {},
+	});
+	is %init<result><protocolVersion>, '2025-11-25', 'Legacy handshake still answers legacy';
+
+	my %legacy-call = $server.handle-request({
+		jsonrpc => '2.0', id => 11, method => 'tools/call',
+		params => { name => 'greet', arguments => { name => 'Legacy' } },
+	});
+	is %legacy-call<result><content>[0]<text>, 'Hello, Legacy!', 'Legacy call answered';
+	nok %legacy-call<result><resultType>:exists, 'Legacy results carry no modern envelope';
+
+	my %modern-list = $server.handle-request({
+		jsonrpc => '2.0', id => 12, method => 'tools/list',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	});
+	is %modern-list<result><resultType>, 'complete', 'Modern request answered in the modern era';
+	ok %modern-list<result><ttlMs>:exists, 'Modern listing carries cache metadata';
+
+	my %pong = $server.handle-request({ jsonrpc => '2.0', id => 13, method => 'ping' });
+	ok %pong<result>.defined, 'The legacy session keeps working afterwards';
+};
+
+subtest 'Modern ping is gone while legacy ping survives' => {
+	plan 2;
+	my %modern-ping = $server.handle-request({
+		jsonrpc => '2.0', id => 20, method => 'ping',
+		params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } },
+	});
+	is %modern-ping<error><code>, -32601, 'Modern ping is method-not-found';
+
+	my %bare-ping = $server.handle-request({ jsonrpc => '2.0', id => 21, method => 'ping' });
+	ok %bare-ping<result>.defined, 'A bare ping still pongs';
 };
 
 done-testing;

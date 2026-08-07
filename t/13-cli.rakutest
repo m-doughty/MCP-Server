@@ -1,0 +1,225 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use MCP::Server;
+use MCP::Server::CLI;
+
+plan 10;
+
+#| Minimal $*OUT / $*ERR stand-in so CLI output can be asserted on without
+#| polluting the TAP stream.
+class OutputShim {
+	has Str $.text = '';
+	method print(*@args) { $!text ~= @args.join; True }
+	method say(*@args)   { $!text ~= @args.join ~ "\n"; True }
+	method print-nl()    { $!text ~= "\n"; True }
+	method flush()       { True }
+}
+
+#| Run the CLI with stdout and stderr captured; returns (exit-code, out, err).
+sub capture(@args) {
+	my $out = OutputShim.new;
+	my $err = OutputShim.new;
+	my $rc;
+	{
+		my $*OUT = $out;
+		my $*ERR = $err;
+		$rc = MCP::Server::CLI::run(@args);
+	}
+	($rc, $out.text, $err.text);
+}
+
+subtest 'parse-args defaults' => {
+	plan 6;
+	my %opts = parse-args(['--tool=TestKit']);
+	is %opts<action>, 'serve', 'Default action is serve';
+	is %opts<name>, 'raku-mcp', 'Default server name';
+	nok %opts<version>.defined, 'No default version';
+	nok %opts<instructions>.defined, 'No default instructions';
+	is %opts<tools>.elems, 1, 'One toolkit requested';
+	is %opts<tools>[0].key, 'TestKit', 'Toolkit name captured';
+};
+
+subtest 'parse-args scalar options' => {
+	plan 4;
+	my %opts = parse-args([
+		'--config=/tmp/x.json', '--name=srv', '--version=9.9', '--instructions=Do things',
+	]);
+	is %opts<config>, '/tmp/x.json', 'config captured';
+	is %opts<name>, 'srv', 'name captured';
+	is %opts<version>, '9.9', 'version captured';
+	is %opts<instructions>, 'Do things', 'instructions captured';
+};
+
+subtest 'parse-args toolkit specs' => {
+	plan 7;
+	my %repeat = parse-args(['--tool=TestKit', '--tool=MCP::Server::Tool::StrictKit']);
+	is %repeat<tools>.elems, 2, '--tool is repeatable';
+	is %repeat<tools>[1].key, 'MCP::Server::Tool::StrictKit', 'Qualified name kept verbatim';
+	is-deeply %repeat<tools>[0].value, {}, 'No inline config means an empty config';
+
+	my %json = parse-args(['--tool=TestKit={"greeting":"hi"}']);
+	is %json<tools>[0].key, 'TestKit', 'Name split off the JSON';
+	is %json<tools>[0].value<greeting>, 'hi', 'Inline JSON config parsed';
+
+	my %eq = parse-args(['--tool=TestKit={"greeting":"a=b"}']);
+	is %eq<tools>[0].value<greeting>, 'a=b', 'Split happens on the first = only';
+
+	my %prefixed = parse-args(['--tool=TestKit={"prefix":"kit"}']);
+	is %prefixed<tools>[0].value<prefix>, 'kit', 'prefix travels in the config';
+};
+
+subtest 'parse-args describe' => {
+	plan 5;
+	my %bare = parse-args(['--describe=TestKit']);
+	is %bare<action>, 'describe', 'describe action';
+	is %bare<describe>, 'TestKit', 'describe target';
+	nok %bare<describe-config>.defined, 'No inline config';
+
+	my %with-config = parse-args(['--describe=TestKit={"greeting":"hi"}']);
+	is %with-config<describe-config><greeting>, 'hi', 'Inline describe config parsed';
+
+	is parse-args(['--help'])<action>, 'help', 'help action';
+};
+
+#| Parsing only: starting a listener belongs to t/19.
+subtest 'parse-args HTTP transport options' => {
+	plan 12;
+
+	my %off = parse-args(['--tool=TestKit']);
+	nok %off<http>.defined, 'Without --http there is no HTTP port';
+	nok %off<host>.defined, 'No default host';
+	nok %off<http-path>.defined, 'No default path';
+	is %off<allow-origins>.elems, 0, 'No allowed origins by default';
+
+	my %on = parse-args([
+		'--tool=TestKit', '--http=8080', '--host=0.0.0.0', '--http-path=api/mcp',
+		'--allow-origin=https://a.example', '--allow-origin=https://b.example',
+	]);
+	is %on<action>, 'serve', 'HTTP options still mean serve';
+	is %on<http>, 8080, 'Port captured as a number';
+	is %on<host>, '0.0.0.0', 'host captured';
+	is %on<http-path>, 'api/mcp', 'http-path captured';
+	is-deeply %on<allow-origins>.List, ('https://a.example', 'https://b.example'),
+		'--allow-origin is repeatable';
+
+	my sub err(@args) { parse-args(@args)<error> // '' }
+
+	ok err(['--tool=TestKit', '--http=70000']).contains('port from 1 to 65535'),
+		'An out-of-range port is rejected';
+	ok err(['--tool=TestKit', '--host=0.0.0.0']).contains('pass --http=PORT'),
+		'HTTP settings without --http are a mistake worth reporting';
+	is parse-args(['--config=/tmp/x.json', '--host=0.0.0.0'])<action>, 'serve',
+		'...unless --config is in play, where the file may switch HTTP on';
+};
+
+#| The other half of the HTTP wiring: a config file may carry the same settings,
+#| and serve() reads them off the server it just built.
+subtest 'HTTP settings travel from a config file' => {
+	plan 5;
+
+	my $path = $*TMPDIR.add("mcp-cli-http-{$*PID}.json");
+	LEAVE { try $path.unlink }
+
+	$path.spurt(q:to/END/);
+	{ "name": "configured",
+	  "http": { "port": 8123, "host": "0.0.0.0", "path": "api/mcp",
+	            "allowedOrigins": ["https://app.example"] } }
+	END
+
+	my %http = MCP::Server.from-config($path).http-config;
+	is %http<port>, 8123, 'Port read from the config file';
+	is %http<host>, '0.0.0.0', 'Host read from the config file';
+	is %http<path>, 'api/mcp', 'Path read from the config file';
+	is-deeply %http<allowedOrigins>.List, ('https://app.example',), 'Allowed origins read too';
+
+	$path.spurt('{ "name": "configured", "http": { "prt": 8123 } }');
+	my Str $message;
+	{
+		MCP::Server.from-config($path);
+		CATCH { default { $message = .message } }
+	}
+	ok ($message // '').contains("Unknown key(s) in the 'http' section"),
+		'A typo in the http section is caught when the file is read';
+};
+
+#| A config file's allowedOrigins comes back from the http hash itemized, so a
+#| naive flat() treats the whole array as one element -- this is the exact
+#| shape that made MCP::Server::HTTP.TWEAK die on startup before the fix.
+subtest 'merge-http-options: config allowedOrigins survive alongside --allow-origin flags' => {
+	plan 5;
+
+	my $path = $*TMPDIR.add("mcp-cli-origins-{$*PID}.json");
+	LEAVE { try $path.unlink }
+
+	$path.spurt(q:to/END/);
+	{ "name": "configured",
+	  "http": { "allowedOrigins": ["https://a.example", "https://b.example"] } }
+	END
+
+	my %http = MCP::Server.from-config($path).http-config;
+	my %opts = parse-args(['--tool=TestKit', '--allow-origin=https://c.example']);
+
+	my %merged = merge-http-options(%opts, %http);
+	is %merged<allowed-origins>.elems, 3, 'Config origins and the flag origin all arrive';
+	for %merged<allowed-origins>.List -> $origin {
+		isa-ok $origin, Str, "Each merged origin ($origin) is an individual Str, not a nested Array";
+	}
+	is-deeply %merged<allowed-origins>.List,
+		('https://a.example', 'https://b.example', 'https://c.example').List,
+		'Config entries precede --allow-origin flags in the merged list';
+};
+
+subtest 'parse-args errors' => {
+	plan 8;
+	my sub err(@args) { parse-args(@args)<error> // '' }
+
+	is parse-args(['--nope'])<action>, 'error', 'Unknown flag is an error';
+	ok err(['--nope']).contains('Unknown option'), 'Unknown flag message';
+	ok err(['--config=a', '--tool=TestKit']).contains('mutually exclusive'),
+		'--config with --tool is rejected';
+	ok err(['--describe=TestKit', '--tool=TestKit']).contains('cannot be combined'),
+		'--describe with --tool is rejected';
+	ok err(['--config']).contains('requires a value'), 'Missing value is rejected';
+	ok err(['--name=']).contains('non-empty'), 'Empty value is rejected';
+	ok err(['positional']).contains('Unrecognised argument'), 'Positional args are rejected';
+	ok err(['--tool=TestKit={oops}']).contains('Invalid JSON config'),
+		'Broken inline JSON is rejected';
+};
+
+subtest 'run: help and usage errors' => {
+	plan 7;
+	my ($rc, $out, $err) = capture(['--help']);
+	is $rc, 0, '--help exits 0';
+	ok $out.contains('Usage:'), 'Usage goes to stdout';
+	is $err, '', 'Nothing on stderr for --help';
+
+	($rc, $out, $err) = capture(['--nope']);
+	is $rc, 2, 'Unknown flag exits 2';
+	is $out, '', 'Nothing on stdout for a usage error';
+	ok $err.contains('Unknown option'), 'Diagnostic goes to stderr';
+
+	is capture([])[0], 2, 'No arguments exits 2';
+};
+
+subtest 'run: describe' => {
+	plan 10;
+	my ($rc, $out, $err) = capture(['--describe=TestKit']);
+	is $rc, 0, 'describe exits 0';
+	ok $out.contains('MCP::Server::Tool::TestKit'), 'Resolved toolkit name printed';
+	ok $out.contains('greeting'), 'Attribute name printed';
+	ok $out.contains('root'), 'Second attribute printed';
+	ok $out.contains('optional'), 'Optional attributes flagged';
+	nok $out.contains('Tools:'), 'No tool list without config';
+
+	ok capture(['--describe=StrictKit'])[1].contains('required'),
+		'Required attributes flagged';
+
+	($rc, $out, $err) = capture(['--describe=TestKit={"greeting":"hi"}']);
+	ok $out.contains('greet'), 'Tool name listed when config is supplied';
+	ok $out.contains('Greet somebody by name'), 'Tool description listed';
+
+	is capture(['--describe=NoSuchKit'])[0], 2, 'Unloadable toolkit exits 2';
+};
+
+done-testing;

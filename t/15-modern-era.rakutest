@@ -1,0 +1,271 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+
+plan 9;
+
+# Build a request that carries the modern era marker.  Registration order is
+# deliberately unsorted in the fixtures below so the listing tests can prove the
+# server sorts rather than getting lucky with hash order.
+sub modern(
+	$id, Str:D $method, %params = {},
+	Str :$version = MODERN-PROTOCOL-VERSION, Str :$log-level --> Hash
+) {
+	my %meta = (META-PROTOCOL-VERSION) => $version;
+	%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+	my %full = %params;
+	%full<_meta> = %meta;
+	{ jsonrpc => '2.0', :$id, :$method, params => %full };
+}
+
+sub fixture(|c --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<modern-server>, :version<2.0.0>, :instructions('Be nice'), |c);
+
+	$server.tool: 'zeta', :description('Last alphabetically'), :handler(-> :%args { 'zeta ran' });
+	$server.tool: 'alpha', :handler(-> :%args { 'alpha ran' });
+	$server.tool: 'boom', :handler(-> :%args { die 'tool exploded' });
+
+	$server.prompt: 'zed', :handler(-> :%args { { messages => [] } });
+	$server.prompt: 'abe', :handler(-> :%args { { messages => [] } });
+
+	$server.resource: 'mem://plain', :name<plain>, :handler(-> :%args { 'plain body' });
+	$server.resource: 'mem://cached', :name<cached>, :ttl-ms(60_000), :cache-scope<public>,
+		:handler(-> :%args { 'cached body' });
+
+	# Registered through the facade, so the cacheability hints have to survive the
+	# prefixing round trip that toolkits go through.
+	$server.tool-group: 'grp', -> $registrar {
+		$registrar.resource: 'mem://grouped', :name<grouped>, :ttl-ms(15_000), :cache-scope<public>,
+			:handler(-> :%args { 'grouped body' });
+	};
+
+	$server;
+}
+
+subtest 'server/discover shape' => {
+	plan 10;
+	my %resp = fixture().handle-request({ jsonrpc => '2.0', id => 1, method => 'server/discover' });
+	my %result = %resp<result>;
+
+	is %resp<id>, 1, 'id echoed';
+	is-deeply %result<supportedVersions>.List, (MODERN-PROTOCOL-VERSION,).List,
+		'Advertises the modern versions it speaks';
+	is %result<resultType>, 'complete', 'Result is complete';
+	is %result<instructions>, 'Be nice', 'Instructions passed through';
+	is %result<ttlMs>, 3_600_000, 'Default discovery TTL';
+	is %result<cacheScope>, 'private', 'Default cache scope';
+	is-deeply %result<_meta>{META-SERVER-INFO}, { name => 'modern-server', version => '2.0.0' },
+		'serverInfo travels in result _meta';
+	is-deeply %result<capabilities>.keys.sort.List, <prompts resources tools>.List,
+		'Capabilities cover what is registered';
+	nok %result<capabilities><logging>:exists, 'No deprecated logging capability';
+	nok %result<extensions>:exists, 'No extensions key';
+};
+
+subtest 'server/discover without registrations' => {
+	plan 3;
+	my $bare = MCP::Server.new(:name<bare>);
+	my %result = $bare.handle-request({ jsonrpc => '2.0', id => 1, method => 'server/discover' })<result>;
+	is-deeply %result<capabilities>, {}, 'No capabilities are claimed';
+	nok %result<instructions>:exists, 'No instructions key when none were set';
+	is %result<resultType>, 'complete', 'Still a complete result';
+};
+
+subtest 'Modern catalog listings' => {
+	plan 12;
+	my $server = fixture();
+
+	my %tools = $server.handle-request(modern(1, 'tools/list'))<result>;
+	is-deeply %tools<tools>.map(*<name>).List, <alpha boom zeta>.List, 'tools/list sorted by name';
+	is %tools<ttlMs>, 3_600_000, 'tools/list carries the discovery TTL';
+	is %tools<cacheScope>, 'private', 'tools/list carries the cache scope';
+	is %tools<resultType>, 'complete', 'tools/list is complete';
+	ok %tools<_meta>{META-SERVER-INFO}:exists, 'tools/list carries serverInfo';
+
+	my %prompts = $server.handle-request(modern(2, 'prompts/list'))<result>;
+	is-deeply %prompts<prompts>.map(*<name>).List, <abe zed>.List, 'prompts/list sorted by name';
+	is %prompts<ttlMs>, 3_600_000, 'prompts/list carries the discovery TTL';
+	is %prompts<cacheScope>, 'private', 'prompts/list carries the cache scope';
+
+	my %resources = $server.handle-request(modern(3, 'resources/list'))<result>;
+	is-deeply %resources<resources>.map(*<uri>).List,
+		('mem://cached', 'mem://grp/grouped', 'mem://plain').List, 'resources/list sorted by uri';
+	is %resources<ttlMs>, 3_600_000, 'resources/list carries the discovery TTL';
+	is %resources<cacheScope>, 'private', 'resources/list carries the cache scope';
+
+	my %legacy = $server.handle-request({ jsonrpc => '2.0', id => 4, method => 'tools/list' })<result>;
+	is-deeply %legacy<tools>.map(*<name>).List, <alpha boom zeta>.List,
+		'Legacy listings are sorted too';
+};
+
+subtest 'Modern tools/call' => {
+	plan 7;
+	my $server = fixture();
+
+	my %ok = $server.handle-request(
+		modern(1, 'tools/call', { name => 'alpha', arguments => {} }),
+	)<result>;
+	is %ok<content>[0]<text>, 'alpha ran', 'Tool output returned';
+	is %ok<resultType>, 'complete', 'Successful call is complete';
+	ok %ok<_meta>{META-SERVER-INFO}:exists, 'Successful call carries serverInfo';
+	nok %ok<ttlMs>:exists, 'tools/call results carry no cache metadata';
+
+	my %err = $server.handle-request(
+		modern(2, 'tools/call', { name => 'boom', arguments => {} }),
+	)<result>;
+	ok %err<isError>, 'Handler death becomes an isError result';
+	is %err<resultType>, 'complete', 'isError result is still complete';
+
+	my %unknown = $server.handle-request(
+		modern(3, 'tools/call', { name => 'nope', arguments => {} }),
+	);
+	is %unknown<error><code>, INVALID_PARAMS, 'Unknown tool is a protocol error';
+};
+
+subtest 'Modern resources/read cacheability' => {
+	plan 8;
+	my $server = fixture();
+
+	my %plain = $server.handle-request(
+		modern(1, 'resources/read', { uri => 'mem://plain' }),
+	)<result>;
+	is %plain<contents>[0]<text>, 'plain body', 'Resource body returned';
+	is %plain<ttlMs>, 0, 'Resources default to uncacheable';
+	is %plain<cacheScope>, 'private', 'Resources default to private';
+
+	my %cached = $server.handle-request(
+		modern(2, 'resources/read', { uri => 'mem://cached' }),
+	)<result>;
+	is %cached<ttlMs>, 60_000, 'Per-resource ttl-ms honoured';
+	is %cached<cacheScope>, 'public', 'Per-resource cache-scope honoured';
+
+	my %grouped = $server.handle-request(
+		modern(3, 'resources/read', { uri => 'mem://grp/grouped' }),
+	)<result>;
+	is %grouped<ttlMs>, 15_000, 'Hints registered through a registrar survive prefixing';
+	is %grouped<cacheScope>, 'public', 'Registrar cache-scope survives prefixing';
+
+	my %missing = $server.handle-request(
+		modern(4, 'resources/read', { uri => 'mem://gone' }),
+	);
+	is %missing<error><code>, INVALID_PARAMS, 'Unknown resource aligns on -32602';
+};
+
+subtest 'Protocol version negotiation' => {
+	plan 8;
+	my $server = fixture();
+
+	my %future = $server.handle-request(modern(1, 'tools/list', {}, :version('9999-01-01')));
+	is %future<error><code>, UNSUPPORTED_PROTOCOL_VERSION, 'Unknown future version is rejected';
+	is %future<error><data><requested>, '9999-01-01', 'Rejection names what was requested';
+	is-deeply %future<error><data><supported>.List, SUPPORTED-PROTOCOL-VERSIONS.List,
+		'Rejection names every version this server speaks';
+
+	my %legacy-via-meta = $server.handle-request(
+		modern(2, 'tools/list', {}, :version(LEGACY-PROTOCOL-VERSION)),
+	);
+	is %legacy-via-meta<error><code>, UNSUPPORTED_PROTOCOL_VERSION,
+		'The legacy version is not a modern _meta version';
+	is %legacy-via-meta<error><data><requested>, LEGACY-PROTOCOL-VERSION,
+		'Rejection names the legacy version that was asked for';
+
+	# server/discover is the bootstrap probe: it must answer without _meta, since
+	# answering is how a client learns which versions to ask for.
+	my %discover = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'server/discover',
+		params => { _meta => { (META-PROTOCOL-VERSION) => '9999-01-01' } },
+	});
+	ok %discover<result>:exists, 'server/discover is exempt from the version gate';
+
+	my %no-meta = $server.handle-modern-request({ jsonrpc => '2.0', id => 4, method => 'tools/list' });
+	is %no-meta<error><code>, UNSUPPORTED_PROTOCOL_VERSION, 'A modern request without _meta is rejected';
+	nok %no-meta<error><data><requested>.defined, 'Nothing was requested to report back';
+};
+
+subtest 'Methods removed in the modern era' => {
+	plan 6;
+	my $server = fixture();
+
+	for <ping logging/setLevel> -> $method {
+		my %resp = $server.handle-request(modern(1, $method, { level => 'debug' }));
+		is %resp<error><code>, METHOD_NOT_FOUND, "$method is gone in the modern era";
+	}
+
+	my %listen = $server.handle-request(modern(2, 'subscriptions/listen'));
+	is %listen<error><code>, METHOD_NOT_FOUND,
+		'subscriptions/listen is not implemented (no change notifications, no listChanged)';
+
+	my %legacy-listen = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'subscriptions/listen',
+	});
+	is %legacy-listen<error><code>, METHOD_NOT_FOUND, 'subscriptions/listen is absent in both eras';
+
+	my %pong = $server.handle-request({ jsonrpc => '2.0', id => 4, method => 'ping' });
+	ok %pong<result>.defined, 'Legacy ping still pongs';
+
+	my %init = $server.handle-request({ jsonrpc => '2.0', id => 5, method => 'initialize', params => {} });
+	is %init<result><protocolVersion>, LEGACY-PROTOCOL-VERSION, 'Legacy initialize still handshakes';
+};
+
+subtest 'Restricting :protocol-versions' => {
+	plan 7;
+
+	my $modern-only = fixture(:protocol-versions[MODERN-PROTOCOL-VERSION]);
+	my %init = $modern-only.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'initialize', params => {},
+	});
+	is %init<error><code>, UNSUPPORTED_PROTOCOL_VERSION, 'A modern-only server refuses the handshake';
+	is %init<error><data><requested>, LEGACY-PROTOCOL-VERSION, 'The handshake era is named as requested';
+	is-deeply %init<error><data><supported>.List, (MODERN-PROTOCOL-VERSION,).List,
+		'The refusal names the versions it does speak';
+	ok $modern-only.handle-request(modern(2, 'tools/list'))<result>:exists,
+		'A modern-only server still serves modern requests';
+
+	my $legacy-only = fixture(:protocol-versions[LEGACY-PROTOCOL-VERSION]);
+	my %modern-req = $legacy-only.handle-request(modern(3, 'tools/list'));
+	is %modern-req<error><code>, UNSUPPORTED_PROTOCOL_VERSION,
+		'A legacy-only server refuses modern requests';
+	is-deeply %modern-req<error><data><supported>.List, (LEGACY-PROTOCOL-VERSION,).List,
+		'The refusal points the client back at the legacy era';
+	# Discovery stays answerable so the client learns the bad news from the one
+	# RPC the modern spec makes mandatory: an empty list says "not here".
+	is-deeply $legacy-only.handle-request({
+		jsonrpc => '2.0', id => 4, method => 'server/discover',
+	})<result><supportedVersions>.List, ().List, 'Discovery reports no modern versions';
+};
+
+subtest 'Constructor validation and cacheability overrides' => {
+	plan 11;
+
+	my $picky = MCP::Server.new(:name<picky>);
+	dies-ok {
+		$picky.resource: 'mem://a', :name<a>, :cache-scope<world>, :handler(-> :%args { '' });
+	}, 'An unknown per-resource cache scope dies';
+	dies-ok {
+		$picky.resource: 'mem://b', :name<b>, :ttl-ms(-5), :handler(-> :%args { '' });
+	}, 'A negative per-resource TTL dies';
+	lives-ok {
+		$picky.resource: 'mem://c', :name<c>, :ttl-ms(0), :cache-scope<public>, :handler(-> :%args { '' });
+	}, 'A zero TTL is a legitimate "do not cache"';
+
+	dies-ok { MCP::Server.new(:name<bad>, :protocol-versions[]) },
+		'An empty protocol-versions list dies';
+	dies-ok { MCP::Server.new(:name<bad>, :protocol-versions['1999-01-01']) },
+		'An unknown protocol version dies';
+	dies-ok { MCP::Server.new(:name<bad>, :protocol-versions[MODERN-PROTOCOL-VERSION, '1999-01-01']) },
+		'One bad version among good ones dies';
+	dies-ok { MCP::Server.new(:name<bad>, :discovery-ttl-ms(-1)) }, 'A negative discovery TTL dies';
+	dies-ok { MCP::Server.new(:name<bad>, :cache-scope<shared>) }, 'An unknown cache scope dies';
+
+	my $tuned = MCP::Server.new(
+		:name<tuned>, :discovery-ttl-ms(1_000), :cache-scope<public>,
+	);
+	$tuned.tool: 'only', :handler(-> :%args { 'x' });
+	my %list = $tuned.handle-request(modern(1, 'tools/list'))<result>;
+	is %list<ttlMs>, 1_000, 'Constructor TTL reaches listings';
+	is %list<cacheScope>, 'public', 'Constructor cache scope reaches listings';
+	is $tuned.discovery-document<ttlMs>, 1_000, 'Constructor TTL reaches the discovery document';
+};
+
+done-testing;

@@ -1,0 +1,125 @@
+use Test;
+use lib 'lib';
+use MCP::Server::DSL;
+use MCP::Server;
+use MCP::Server::Toolkit;
+
+plan 6;
+
+mcp Calculator {
+	has Str $.label = 'calc';
+
+	#| Add two numbers
+	method add(Int :$a!, Int :$b!) { $a + $b }
+
+	#| Ping the service
+	method ping() { 'pong' }
+}
+
+sub dies-with(&code, Str:D $needle, Str:D $desc) {
+	my Str $msg;
+	{
+		code();
+		CATCH { default { $msg = .message } }
+	}
+	my $matched = $msg.defined && $msg.contains($needle);
+	ok $matched, $desc;
+	diag "message was: {$msg // '(nothing thrown)'}" unless $matched;
+}
+
+sub tool-names($server) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 99, method => 'tools/list',
+	})<result><tools>.map(*<name>).sort.list;
+}
+
+subtest 'An mcp class is a toolkit' => {
+	plan 3;
+	ok Calculator ~~ MCP::Server::Toolkit, 'mcp classes do the Toolkit role';
+	ok Calculator.new ~~ MCP::Server::Toolkit, 'Instances too';
+	ok Calculator.^can('register'), 'register is available for plug';
+};
+
+subtest 'Plugged into a host server under a prefix' => {
+	plan 5;
+	my $host = MCP::Server.new(:name<host>, :version<1.0>);
+	my $calc = Calculator.new;
+	ok $host.plug($calc, :prefix<calc>) === $host, 'plug returns the host server';
+
+	is-deeply tool-names($host), ('calc_add', 'calc_label', 'calc_ping'),
+		'Every method is registered behind the prefix';
+
+	my %resp = $host.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	is %resp<result><tools>.first(*<name> eq 'calc_add')<description>, 'Add two numbers',
+		'Doc comments survive as tool descriptions';
+
+	my %call = $host.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => { name => 'calc_add', arguments => { a => 2, b => 3 } },
+	});
+	is %call<result><content>[0]<text>, '5', 'Prefixed tool dispatches to the instance';
+
+	my %ping = $host.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'tools/call',
+		params => { name => 'calc_ping', arguments => {} },
+	});
+	is %ping<result><content>[0]<text>, 'pong', 'Second prefixed tool works too';
+};
+
+subtest 'The standalone .server is still built lazily and separately' => {
+	plan 5;
+	my $host = MCP::Server.new(:name<host>);
+	my $calc = Calculator.new;
+	$host.plug($calc, :prefix<calc>);
+
+	my $own = $calc.server;
+	ok $own ~~ MCP::Server, 'Instance still has its own server';
+	nok $own === $host, 'The instance server is not the host';
+	is-deeply tool-names($own), ('add', 'label', 'ping'), 'Own server registers bare names';
+	ok $calc.server === $own, 'The server is memoised';
+
+	my %call = $calc.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'add', arguments => { a => 4, b => 4 } },
+	});
+	is %call<result><content>[0]<text>, '8', 'Delegated handle-request still works';
+};
+
+subtest 'Delegation methods replaced the handles trait' => {
+	plan 3;
+	my $calc = Calculator.new;
+	can-ok $calc, 'tools-for-llm', 'tools-for-llm is delegated';
+	can-ok $calc, 'execute-tool-calls', 'execute-tool-calls is delegated';
+	ok $calc.tools-for-llm.first({ .<function><name> eq 'add' }).defined,
+		'tools-for-llm reaches the underlying server';
+};
+
+subtest 'from-config on an mcp class' => {
+	plan 4;
+	is Calculator.from-config({ label => 'mine' }).label, 'mine', 'Public attributes are config keys';
+
+	nok Calculator.^attributes(:all).grep(*.has_accessor).map({ .name.substr(2) }).first('server'),
+		'The server attribute is private, so never a config key';
+
+	dies-with { Calculator.from-config({ server => 'nope' }) },
+		'Unknown config key(s)', "'server' is rejected as a config key";
+
+	dies-with { Calculator.from-config({ labl => 'typo' }) },
+		'Valid keys: label', 'Unknown key dies listing the valid keys';
+};
+
+subtest 'Collisions when plugging twice' => {
+	plan 2;
+	my $host = MCP::Server.new(:name<host>);
+	my $calc = Calculator.new;
+	$host.plug($calc);
+
+	dies-with { $host.plug($calc) },
+		'plug($kit, :prefix<other>)', 'Second unprefixed plug dies suggesting a prefix';
+
+	lives-ok { $host.plug($calc, :prefix<second>) }, 'A prefixed second plug is fine';
+};
+
+done-testing;

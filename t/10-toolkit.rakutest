@@ -1,0 +1,187 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use MCP::Server;
+use MCP::Server::Toolkit;
+use MCP::Server::Tool::TestKit;
+use MCP::Server::Tool::StrictKit;
+
+plan 9;
+
+sub dies-with(&code, Str:D $needle, Str:D $desc) {
+	my Str $msg;
+	{
+		code();
+		CATCH { default { $msg = .message } }
+	}
+	my $matched = $msg.defined && $msg.contains($needle);
+	ok $matched, $desc;
+	diag "message was: {$msg // '(nothing thrown)'}" unless $matched;
+}
+
+sub names($server, Str:D $method, Str:D $list, Str:D $key = 'name') {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 99, method => $method,
+	})<result>{$list}.map({ .{$key} }).sort.list;
+}
+
+subtest 'Plug without a prefix registers bare names' => {
+	plan 4;
+	my $server = MCP::Server.new(:name<plain>);
+	$server.plug: MCP::Server::Tool::TestKit.new;
+
+	is-deeply names($server, 'tools/list', 'tools'), ('greet',), 'Tool registered unprefixed';
+	is-deeply names($server, 'prompts/list', 'prompts'), ('greeting',), 'Prompt registered unprefixed';
+	is-deeply names($server, 'resources/list', 'resources', 'uri'), ('test://info',), 'Resource URI untouched';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'greet', arguments => { name => 'Ada' } },
+	});
+	is %call<result><content>[0]<text>, 'Hello, Ada', 'Tool callable with kit defaults';
+};
+
+subtest 'Plug with a prefix namespaces everything' => {
+	plan 6;
+	my $server = MCP::Server.new(:name<prefixed>);
+	$server.plug: MCP::Server::Tool::TestKit.new(:greeting<Hi>), :prefix<kit>;
+
+	is-deeply names($server, 'tools/list', 'tools'), ('kit_greet',), 'Tool name gets underscore prefix';
+	is-deeply names($server, 'prompts/list', 'prompts'), ('kit_greeting',), 'Prompt name gets underscore prefix';
+	is-deeply names($server, 'resources/list', 'resources', 'uri'), ('test://kit/info',),
+		'Resource URI gets prefix as first path segment';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'kit_greet', arguments => { name => 'Bob' } },
+	});
+	is %call<result><content>[0]<text>, 'Hi, Bob', 'Prefixed tool callable';
+
+	my %prompt = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'prompts/get',
+		params => { name => 'kit_greeting', arguments => { name => 'Bob' } },
+	});
+	is %prompt<result><messages>[0]<content><text>, 'Hi, Bob!', 'Prefixed prompt retrievable';
+
+	my %read = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'resources/read',
+		params => { uri => 'test://kit/info' },
+	});
+	ok %read<result><contents>[0]<text>.contains('greeting=Hi'), 'Rewritten resource URI readable';
+};
+
+subtest 'Resource URI rewriting shapes' => {
+	plan 4;
+	my $server = MCP::Server.new(:name<uris>);
+	my $reg = MCP::Server::Registrar.new(:$server, :prefix<docs>);
+	is $reg.prefixed-uri('config://settings'), 'config://docs/settings', 'scheme://path';
+	is $reg.prefixed-uri('file:///etc/hosts'), 'file://docs/etc/hosts',
+		'No empty path segment for authority-less URIs';
+	is $reg.prefixed-uri('bare/path'), 'docs/bare/path', 'URI without :// gets a path prefix';
+	is-deeply MCP::Server::Registrar.new(:$server).prefixed-uri('config://settings'),
+		'config://settings', 'No prefix leaves the URI alone';
+};
+
+subtest 'default-prefix is honoured and overridable' => {
+	plan 4;
+	my $default = MCP::Server.new(:name<default-prefix>);
+	$default.plug: MCP::Server::Tool::StrictKit.new(:token<abc>);
+	is-deeply names($default, 'tools/list', 'tools'), ('strict_peek',), 'default-prefix applied';
+
+	my %call = $default.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'strict_peek', arguments => {} },
+	});
+	is %call<result><content>[0]<text>, 'token=abc limit=10', 'Defaulted-prefix tool callable';
+
+	my $override = MCP::Server.new(:name<override-prefix>);
+	$override.plug: MCP::Server::Tool::StrictKit.new(:token<abc>), :prefix<other>;
+	is-deeply names($override, 'tools/list', 'tools'), ('other_peek',), 'Explicit prefix wins';
+
+	my $none = MCP::Server.new(:name<no-default-prefix>);
+	$none.plug: MCP::Server::Tool::TestKit.new;
+	is-deeply names($none, 'tools/list', 'tools'), ('greet',),
+		'Undefined default-prefix means no prefix';
+};
+
+subtest 'Custom separator' => {
+	plan 2;
+	my $server = MCP::Server.new(:name<sep>);
+	$server.plug: MCP::Server::Tool::TestKit.new, :prefix<kit>, :sep<->;
+	is-deeply names($server, 'tools/list', 'tools'), ('kit-greet',), 'Separator overridden';
+
+	my %call = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'kit-greet', arguments => { name => 'Eve' } },
+	});
+	is %call<result><content>[0]<text>, 'Hello, Eve', 'Custom-separator tool callable';
+};
+
+subtest 'from-config validation' => {
+	plan 6;
+	my $kit = MCP::Server::Tool::TestKit.from-config({ greeting => 'Yo', root => '/tmp' });
+	is $kit.greeting, 'Yo', 'Config value applied';
+	ok $kit.root ~~ IO::Path, 'Str config value coerced to IO::Path';
+
+	dies-with { MCP::Server::Tool::TestKit.from-config({ greetng => 'typo' }) },
+		'Valid keys: greeting, root', 'Unknown key dies listing the valid keys';
+
+	dies-with { MCP::Server::Tool::StrictKit.from-config({ limit => 5 }) },
+		'Missing required config key(s)', 'Missing required attribute dies';
+
+	dies-with { MCP::Server::Tool::TestKit.from-config({ prefix => 'kit' }) },
+		"Config key 'prefix' is reserved", 'Reserved prefix key dies';
+
+	is MCP::Server::Tool::StrictKit.from-config({ token => 't', limit => 3 }).limit, 3,
+		'All keys supplied builds cleanly';
+};
+
+subtest 'Collision policy' => {
+	plan 5;
+	my $server = MCP::Server.new(:name<collide>);
+	$server.plug: MCP::Server::Tool::TestKit.new;
+
+	dies-with { $server.plug(MCP::Server::Tool::TestKit.new) },
+		'prefix', 'Re-plugging unprefixed dies suggesting a prefix';
+
+	lives-ok { $server.plug(MCP::Server::Tool::TestKit.new, :prefix<second>) },
+		'Re-plugging under a prefix is fine';
+
+	dies-with { $server.prompt('greeting', handler => -> :%args { 'x' }) },
+		'Duplicate prompt', 'Duplicate prompt dies';
+
+	dies-with { $server.resource('test://info', name => 'dup', handler => -> :%args { 'x' }) },
+		'Duplicate resource URI', 'Duplicate resource URI dies';
+
+	dies-with { $server.tool('greet', handler => -> :%args { 'x' }) },
+		'Duplicate tool', 'Duplicate tool dies';
+};
+
+subtest 'Tool name charset' => {
+	plan 4;
+	my $server = MCP::Server.new(:name<charset>);
+	dies-with { $server.tool('file/read', handler => -> :%args { 'x' }) },
+		'Invalid tool name', 'Slash in tool name dies';
+	dies-with { $server.tool('has space', handler => -> :%args { 'x' }) },
+		'Invalid tool name', 'Space in tool name dies';
+	dies-with { $server.tool('a' x 129, handler => -> :%args { 'x' }) },
+		'Invalid tool name', 'Over-long tool name dies';
+	lives-ok { $server.tool('kit_read-file9', handler => -> :%args { 'x' }) },
+		'Letters, digits, underscore and hyphen are accepted';
+};
+
+subtest 'plug contract' => {
+	plan 5;
+	my $server = MCP::Server.new(:name<contract>);
+	ok ToolGroup === MCP::Server::Registrar, 'ToolGroup still resolves (back-compat alias)';
+	ok $server.plug(MCP::Server::Tool::TestKit.new) === $server, 'plug returns the server';
+
+	dies-with { $server.plug('not-a-toolkit') },
+		'.register method', 'Plugging a non-toolkit dies';
+	dies-with { $server.plug(MCP::Server::Tool::TestKit) },
+		'.register method', 'Plugging an undefined toolkit type object dies';
+
+	ok MCP::Server::Tool::TestKit ~~ MCP::Server::Toolkit, 'Fixture kit does the Toolkit role';
+};
+
+done-testing;

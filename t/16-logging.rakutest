@@ -1,0 +1,203 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+
+plan 7;
+
+#| Transport that plays a canned script of inbound lines and records everything
+#| the server writes, in order.
+class ScriptedTransport does MCP::Server::Transport {
+	has @.inbound;
+	has @.written;
+
+	method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+	method write-message(Str:D $msg) { @!written.push($msg) }
+	method messages(--> List) { @!written.map({ from-json($_) }).list }
+}
+
+#| Stand-in for $*ERR so log lines land in an array instead of the test output.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+sub notifications(@messages --> List) {
+	@messages.grep({ ($_<method>:exists) && $_<method> eq 'notifications/message' }).list;
+}
+
+sub noisy-server(--> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<log-server>, :version<1.0.0>);
+	$server.tool: 'noisy', :handler(-> :%args {
+		$server.log('debug', 'quiet detail');
+		$server.log('error', 'loud problem');
+		'done';
+	});
+	$server;
+}
+
+#| Run a whole stdio session against a scripted transport, capturing stderr.
+#| The messages are slurped non-flatteningly (**@) so a single-message session
+#| does not get its one hash spread into pairs by the single-argument rule.
+sub play(MCP::Server:D $server, **@messages --> List) {
+	my $transport = ScriptedTransport.new(inbound => @messages.map({ to-json($_, :!pretty) }).Array);
+	my $err = ErrSink.new;
+	{
+		my $*ERR = $err;
+		$server.run(:$transport);
+	}
+	($transport, $err);
+}
+
+my %init-request = jsonrpc => '2.0', id => 1, method => 'initialize', params => {};
+my %initialized = jsonrpc => '2.0', method => 'notifications/initialized';
+my %noisy-call = jsonrpc => '2.0', id => 2, method => 'tools/call',
+	params => { name => 'noisy', arguments => {} };
+
+subtest 'Legacy logging/setLevel validation' => {
+	plan 6;
+	my $server = noisy-server();
+
+	my %ok = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'logging/setLevel', params => { level => 'warning' },
+	});
+	is-deeply %ok<result>, {}, 'A known level is accepted with an empty result';
+
+	my %bogus = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'logging/setLevel', params => { level => 'chatty' },
+	});
+	is %bogus<error><code>, INVALID_PARAMS, 'An unknown level is rejected';
+	ok %bogus<error><message>.contains('emergency'), 'The rejection lists the levels on offer';
+
+	my %missing = $server.handle-request({
+		jsonrpc => '2.0', id => 3, method => 'logging/setLevel', params => {},
+	});
+	is %missing<error><code>, INVALID_PARAMS, 'A missing level is rejected';
+
+	my %wrong-type = $server.handle-request({
+		jsonrpc => '2.0', id => 4, method => 'logging/setLevel', params => { level => 42 },
+	});
+	is %wrong-type<error><code>, INVALID_PARAMS, 'A non-string level is rejected';
+
+	my %empty = $server.handle-request({
+		jsonrpc => '2.0', id => 5, method => 'logging/setLevel', params => { level => '' },
+	});
+	is %empty<error><code>, INVALID_PARAMS, 'An empty level is rejected';
+};
+
+subtest 'Legacy logging is gated on the handshake' => {
+	plan 3;
+	my ($transport, $err) = play(noisy-server(), %init-request, %noisy-call);
+
+	is notifications($transport.messages).elems, 0,
+		'Nothing is sent to a client that never said it was initialized';
+	is $transport.messages.grep({ $_<result>:exists }).elems, 2, 'Both requests were still answered';
+	ok $err.lines.grep({ $_.contains('loud problem') }), 'The message still reached stderr';
+};
+
+subtest 'Legacy logging reaches an initialized client' => {
+	plan 4;
+	my ($transport, $err) = play(noisy-server(), %init-request, %initialized, %noisy-call);
+	my @notifs = notifications($transport.messages);
+
+	ok @notifs.grep({ $_<params><message> eq 'Client initialized' }),
+		'Out-of-request logging goes to the transport';
+	ok @notifs.grep({ $_<params><message> eq 'quiet detail' }), 'debug is emitted at the default level';
+	ok @notifs.grep({ $_<params><message> eq 'loud problem' }), 'error is emitted';
+	is @notifs.grep({ $_<params><message> eq 'loud problem' })[0]<params><logger>, 'log-server',
+		'Notifications name the logger';
+};
+
+subtest 'Legacy logging respects the setLevel threshold' => {
+	plan 3;
+	my %set-level = jsonrpc => '2.0', id => 3, method => 'logging/setLevel',
+		params => { level => 'error' };
+	my ($transport, $err) = play(
+		noisy-server(), %init-request, %initialized, %set-level, %noisy-call,
+	);
+	my @notifs = notifications($transport.messages);
+
+	nok @notifs.grep({ $_<params><message> eq 'quiet detail' }), 'Below-threshold messages are dropped';
+	ok @notifs.grep({ $_<params><message> eq 'loud problem' }), 'At-threshold messages are kept';
+	ok $err.lines.grep({ $_.contains('quiet detail') }),
+		'Dropped messages still reach stderr';
+};
+
+subtest 'Modern per-request logging' => {
+	plan 6;
+	my $server = noisy-server();
+
+	sub call-with(Str :$log-level, Str :$version = MODERN-PROTOCOL-VERSION --> List) {
+		my @notifs;
+		my %meta = (META-PROTOCOL-VERSION) => $version;
+		%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+		my $*ERR = ErrSink.new;
+		my %resp = $server.handle-modern-request(
+			{
+				jsonrpc => '2.0', id => 1, method => 'tools/call',
+				params => { name => 'noisy', arguments => {}, _meta => %meta },
+			},
+			notify => -> %n { @notifs.push(%n) },
+		);
+		(%resp, @notifs.map({ $_<params><message> }).list);
+	}
+
+	my (%opted-in, @opted-in) := call-with(:log-level<debug>);
+	is-deeply @opted-in, ('quiet detail', 'loud problem'), 'Opting in delivers both messages';
+	ok %opted-in<result><content>:exists, 'The response still came back';
+
+	my (%raised, @raised) := call-with(:log-level<error>);
+	is-deeply @raised, ('loud problem',), 'A higher opt-in level filters the quieter message';
+
+	my (%silent, @silent) := call-with();
+	is-deeply @silent, ().List,
+		'A request that did not opt in gets no notifications/message at all';
+
+	my (%bogus, @bogus) := call-with(:log-level<chatty>);
+	is-deeply @bogus, ().List, 'An unusable logLevel is treated as absent, not as an error';
+	ok %bogus<result><content>:exists, 'An unusable logLevel does not fail the request';
+};
+
+subtest 'Modern notifications interleave ahead of the response on stdio' => {
+	plan 5;
+	my %modern-call = jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => {
+			name => 'noisy', arguments => {},
+			_meta => {
+				(META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION,
+				(META-LOG-LEVEL) => 'debug',
+			},
+		};
+	my ($transport, $err) = play(noisy-server(), %modern-call);
+	my @messages = $transport.messages;
+
+	is @messages.elems, 3, 'Two notifications and one response were written';
+	is @messages[0]<params><message>, 'quiet detail', 'First notification comes first';
+	is @messages[1]<params><message>, 'loud problem', 'Second notification keeps its order';
+	ok @messages[2]<result><content>:exists, 'The response is written last';
+	is @messages[2]<id>, 2, 'The response belongs to the request';
+};
+
+subtest 'Modern logging ignores the legacy gates' => {
+	plan 2;
+	my %modern-call = jsonrpc => '2.0', id => 3, method => 'tools/call',
+		params => {
+			name => 'noisy', arguments => {},
+			_meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION },
+		};
+	# The session is initialized and the threshold is wide open, but a modern
+	# request that did not opt in still MUST NOT be sent notifications/message.
+	my ($transport, $err) = play(noisy-server(), %init-request, %initialized, %modern-call);
+	my @notifs = notifications($transport.messages);
+
+	nok @notifs.grep({ $_<params><message> eq 'quiet detail' }),
+		'No modern notification without a per-request opt-in';
+	ok @notifs.grep({ $_<params><message> eq 'Client initialized' }),
+		'Legacy out-of-request logging on the same session is unaffected';
+};
+
+done-testing;
