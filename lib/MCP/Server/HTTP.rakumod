@@ -21,6 +21,11 @@ use MCP::Server::HTTP::Validation;
 #| object or, when the handler raises notifications and the client said it would
 #| accept C<text/event-stream>, with an SSE stream scoped to that one request.
 #|
+#| A client hanging up — closing the stream, cancelling the request, losing the
+#| connection — is the only cancellation signal the protocol has, and it reaches
+#| handlers as C<$*MCP-REQUEST-CONTEXT.cancelled>.  Nothing pushes it at us, so
+#| it is watched for; see L<#method !watch-disconnect> and C<$.disconnect-poll>.
+#|
 #| It listens on 127.0.0.1 by default and speaks plain HTTP: put it behind a
 #| reverse proxy for TLS, and use L<#method routes> to mount it inside a larger
 #| Cro application when it needs authentication or other middleware.
@@ -51,11 +56,23 @@ has Bool:D $.allow-no-origin = True;
 #| timing out a stream whose handler is thinking.
 has Real:D $.keepalive = 15;
 
+#| Seconds between client-liveness probes.  A client hanging up is the only
+#| cancellation signal this protocol has, and nothing pushes it at us (see
+#| L<#method !watch-disconnect>), so it is asked for on this interval: the
+#| smaller it is, the sooner a handler polling
+#| C<$*MCP-REQUEST-CONTEXT.cancelled> hears about it, at the cost of one no-op
+#| write per interval per in-flight request.
+has Real:D $.disconnect-poll = 0.25;
+
 # The running Cro::HTTP::Server, or an undefined value while stopped.
 has $!service;
 
 # $.path split for matching; the accessor keeps whatever the caller wrote.
 has Str @!path-segments;
+
+# The liveness probe: an empty write, so asking the question costs the client
+# nothing and tells it nothing.
+my constant EMPTY-PROBE = Blob.new;
 
 # Lowercased header name => the spelling used in diagnostics.
 my constant %REQUIRED-HEADERS = Map.new(
@@ -68,6 +85,8 @@ submethod TWEAK() {
 		unless 1 <= $!port <= 65535;
 	die "MCP HTTP keepalive must be greater than zero seconds, got $!keepalive"
 		unless $!keepalive > 0;
+	die "MCP HTTP disconnect-poll must be greater than zero seconds, got $!disconnect-poll"
+		unless $!disconnect-poll > 0;
 
 	for @!allowed-origins -> $entry {
 		die "Allowed origins must be strings or regexes, got a {$entry.^name}"
@@ -241,7 +260,9 @@ method !handle-post(--> Nil) {
 	# 7. Dispatch.  A body with no id is a notification: JSON-RPC forbids a
 	# response, so it is dispatched for its side effects and acknowledged.
 	unless %msg<id>:exists {
-		$!server.handle-modern-request(%msg);
+		my ($cancelled, $watch) = self!watch-disconnect($req.connection);
+		LEAVE $watch.close;
+		$!server.handle-modern-request(%msg, :$cancelled);
 		response.status = 202;
 		return;
 	}
@@ -251,25 +272,73 @@ method !handle-post(--> Nil) {
 	# spec leaves that choice to the server.
 	my $accept = $req.header('Accept') // '';
 	unless $accept.lc.contains('text/event-stream') {
-		my %response = $!server.handle-modern-request(%msg);
+		my ($cancelled, $watch) = self!watch-disconnect($req.connection);
+		LEAVE $watch.close;
+		my %response = $!server.handle-modern-request(%msg, :$cancelled);
 		self!json(self!status-for(%response), %response);
 		return;
 	}
 
-	self!stream-response(%msg);
+	# The connection is read here rather than inside the stream: `request` is
+	# only reachable while the route block is on the stack, and the stream's
+	# supply block is tapped later, on somebody else's thread.
+	self!stream-response(%msg, $req.connection);
+}
+
+#| A promise kept once the client has hung up, together with the tap that has to
+#| be closed when nobody cares any more.
+#|
+#| Nothing pushes this at us.  A route is handed a request, not a connection
+#| lifetime; the response pipeline only discovers the client is gone when a
+#| write to it fails, which for a handler that has not spoken in a while is when
+#| it finally answers — long past the point where cancelling would have saved
+#| anything.  So the socket is asked instead, on a timer: a zero-byte write puts
+#| nothing on the wire, keeps while the connection is usable, and breaks once
+#| the socket is gone.
+#|
+#| That is a sound test rather than a heuristic, because IO::Socket::Async closes
+#| a socket as soon as it reads EOF from the peer.  A hung-up client is therefore
+#| not merely unlikely to read the answer, it is unreachable — so treating this
+#| as cancellation can never rob a client of a response it would still have got.
+#|
+#| A connection that cannot be probed this way (a TLS socket, whose zero-byte
+#| write says nothing, or a request that arrived without one) leaves the promise
+#| Planned forever, which is exactly the behaviour handlers had before: they run
+#| to completion and their answer is discarded.
+method !watch-disconnect($connection --> List) {
+	my $cancelled = Promise.new;
+
+	return ($cancelled, supply { }.tap) unless $connection ~~ IO::Socket::Async;
+
+	my $tap = supply {
+		whenever Supply.interval($!disconnect-poll, $!disconnect-poll) {
+			whenever $connection.write(EMPTY-PROBE) {
+				# Kept: still writable, and not a byte of it reached the client.
+				QUIT {
+					default {
+						$cancelled.keep(True) if $cancelled.status === Planned;
+						done;
+						True;
+					}
+				}
+			}
+		}
+	}.tap;
+
+	($cancelled, $tap);
 }
 
 #| SSE is decided lazily.  The handler runs while we wait for whichever comes
 #| first: it finishing, or it saying something to the client.  A request that
 #| answers without a word gets a plain JSON response, so only a request that
 #| really has something to stream pays for a stream.
-method !stream-response(%msg --> Nil) {
+method !stream-response(%msg, $connection --> Nil) {
 	my $lock = Lock.new;
 	my @pending;
 	my Bool $streaming = False;
 	my $notifications = Supplier.new;
 	my $first-notification = Promise.new;
-	my $cancelled = Promise.new;
+	my ($cancelled, $watch) = self!watch-disconnect($connection);
 
 	my &notify = -> %notif {
 		my Bool $live = $lock.protect: {
@@ -288,6 +357,12 @@ method !stream-response(%msg --> Nil) {
 	};
 
 	my $work = start { $!server.handle-modern-request(%msg, :&notify, :$cancelled) };
+
+	# Whatever the handler did, once it has stopped there is nothing left to
+	# cancel, so the probe stops with it — including on the plain-JSON path
+	# below, which never reaches the stream's CLOSE.
+	$work.then({ $watch.close });
+
 	await Promise.anyof($work, $first-notification);
 
 	unless $lock.protect({ @pending.elems > 0 }) {
@@ -350,8 +425,14 @@ method !stream-response(%msg --> Nil) {
 		# synchronous one that never looks simply runs to completion and its
 		# result is discarded.  Firing on a normal `done` too is harmless: the
 		# work is already finished by then.
+		#
+		# This is the second of the two ways a hangup is noticed: the pipeline
+		# tears the stream down once a write to the departed client fails.  It
+		# is the slower one — a quiet handler writes nothing to fail on — which
+		# is why the probe above exists as well.
 		CLOSE {
 			$cancelled.keep(True) if $cancelled.status === Planned;
+			$watch.close;
 			$notifications.done;
 		}
 	}

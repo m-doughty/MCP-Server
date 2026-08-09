@@ -7,7 +7,7 @@ use MCP::Server::HTTP;
 use MCP::Server::HTTP::Validation;
 use MCP::Server::Protocol;
 
-plan 15;
+plan 17;
 
 # Every await in this file goes through timed(), so a transport bug shows up as a
 # failing test rather than a CI job that never finishes.
@@ -54,6 +54,28 @@ $server.tool: 'slow', :handler(-> :%args {
 		sleep 0.05;
 	}
 	'eventually';
+});
+
+# Says one thing (so the answer is upgraded to a stream), then polls for
+# cancellation for up to :rounds twentieths of a second, reporting on $verdicts
+# whether it ever saw one.  A handler is the only thing that can prove the flag
+# reached it, so the proof has to come from inside one.
+my $verdicts = Channel.new;
+$server.tool: 'abandonable', :handler(-> :%args {
+	my $rounds = (%args<rounds> // 20).Int;
+	$server.log('info', 'working');
+
+	my Bool $saw = False;
+	for ^$rounds {
+		if $*MCP-REQUEST-CONTEXT.cancelled {
+			$saw = True;
+			last;
+		}
+		sleep 0.05;
+	}
+
+	$verdicts.send($saw);
+	$saw ?? 'stopped early' !! 'ran to completion';
 });
 
 $server.tool: 'count', :handler(-> :%args {
@@ -219,7 +241,7 @@ subtest 'A handler that logs upgrades the answer to an event stream' => {
 
 	my @events = sse-events($response);
 	is @events.elems, 3, 'Two notifications and the response, then the stream closes';
-	is-deeply @events[0 .. 1].map({ $_<params><message> }).List, ('first', 'second').List,
+	is-deeply @events[0 .. 1].map({ $_<params><data> }).List, ('first', 'second').List,
 		'The notifications arrive in the order the handler raised them';
 	is @events[2]<id>, 2, 'The response event comes last';
 	is @events[2]<result><content>[0]<text>, 'chattered', 'The response event carries the result';
@@ -425,7 +447,7 @@ subtest 'Concurrent streams do not cross-talk' => {
 		# single-argument rule would otherwise make it one element.
 		my @events = %stream<events>.List;
 		is @events.elems, 3, "Stream $tag saw exactly its own two notifications and response";
-		is-deeply @events[0 .. 1].map({ $_<params><message> }).List,
+		is-deeply @events[0 .. 1].map({ $_<params><data> }).List,
 			("start $tag", "end $tag").List,
 			"Stream $tag saw nobody else's notifications";
 		is @events[2]<id>, "id-$tag", "Stream $tag ends with its own response";
@@ -465,8 +487,129 @@ subtest 'A client abandoning a stream does not take the server with it' => {
 	is $after.status, 200, 'The endpoint is still serving afterwards';
 };
 
-subtest 'The transport refuses settings it cannot honour' => {
+subtest 'A client hanging up mid-stream reaches the handler as cancellation' => {
 	plan 7;
+
+	#| The handler's own verdict on whether it saw the cancellation flag.  Only a
+	#| handler can prove the flag reached it, so the proof comes from inside one.
+	sub verdict(Str:D $what) {
+		timed(start { $verdicts.receive }, "the handler's verdict on $what");
+	}
+
+	#| The handler was told, and told in time.  Each abandoned call asks for 200
+	#| rounds -- ten seconds of work -- so an answer that arrives in a fraction of
+	#| that can only have come from the cancellation flag.
+	sub observed(Str:D $how, $hung-up-at) {
+		ok verdict($how), "$how: the handler polling \$*MCP-REQUEST-CONTEXT.cancelled sees it";
+		my $noticed-in = now - $hung-up-at;
+		ok $noticed-in < 5,
+			"$how: ...within {$noticed-in.round(0.01)}s, not after its ten seconds of work";
+	}
+
+	sub abandonable-body($id) {
+		body($id, 'tools/call', { name => 'abandonable', arguments => { rounds => 200 } },
+			:log-level<debug>);
+	}
+
+	# First the case that must NOT report a cancellation: a client that stays for
+	# the whole stream.  A watchdog that cries wolf would cut every long request
+	# short, so this is the more dangerous of the two failures.
+	my $whole = post-msg(
+		body(20, 'tools/call', { name => 'abandonable', arguments => { rounds => 12 } },
+			:log-level<debug>),
+		accept => 'text/event-stream',
+	);
+	my @events = sse-events($whole);
+	nok verdict('a client that stayed'), 'A client that reads its stream is never called cancelled';
+	is @events[*-1]<result><content>[0]<text>, 'ran to completion',
+		'...and its handler runs the whole way through';
+
+	# How a real client abandons a stream: MCP::Client, and anything else built
+	# on Cro::HTTP::Client, cancels the response rather than reaching for the
+	# socket.  Nothing about that reaches the route -- Cro hands a handler a
+	# request, not a connection lifetime -- so this is the case the liveness
+	# probe exists for.
+	my %cancelled-msg = abandonable-body(21);
+	my $client = Cro::HTTP::Client.new(:!persistent, :http<1.1>);
+	my $stream = timed(
+		$client.post($endpoint,
+			content-type => 'application/json',
+			body => to-json(%cancelled-msg, :!pretty),
+			headers => [|headers-for(%cancelled-msg), 'Accept' => 'text/event-stream'],
+		),
+		'the stream headers',
+	);
+
+	my $first-event = Promise.new;
+	my $body-tap = $stream.body-byte-stream.tap({
+		$first-event.keep(True) if $first-event.status === Planned;
+	});
+	timed($first-event, 'the first event of the cancelled stream');
+	$body-tap.close;
+
+	my $cancelled-at = now;
+	$stream.cancel;
+	observed('a cancelled Cro response', $cancelled-at);
+
+	# And the blunter version: a socket that simply goes away.  Cro's client
+	# closes its end of the pipeline in its own time, so a raw socket is the only
+	# way to test an abrupt hangup rather than a polite one.
+	my %raw-msg = abandonable-body(22);
+	my $json = to-json(%raw-msg, :!pretty);
+
+	my $conn = timed(IO::Socket::Async.connect('127.0.0.1', $port), 'a raw connection');
+	my $first-bytes = Promise.new;
+	my $tap = $conn.Supply(:bin).tap({ $first-bytes.keep(True) if $first-bytes.status === Planned });
+
+	timed($conn.print(
+		"POST /mcp HTTP/1.1\r\n"
+		~ "Host: 127.0.0.1:$port\r\n"
+		~ "Content-Type: application/json\r\n"
+		~ "Accept: text/event-stream\r\n"
+		~ "MCP-Protocol-Version: {MODERN-PROTOCOL-VERSION}\r\n"
+		~ "Mcp-Method: tools/call\r\n"
+		~ "Mcp-Name: abandonable\r\n"
+		~ "Content-Length: {$json.encode('utf-8').bytes}\r\n"
+		~ "\r\n$json"
+	), 'the raw request to go out');
+
+	timed($first-bytes, 'the first bytes of the raw stream');
+	$tap.close;
+	$conn.close;
+	my $hung-up-at = now;
+	observed('a socket that hung up', $hung-up-at);
+
+	my $after = post-msg(body(23, 'tools/call', { name => 'greet', arguments => { name => 'Em' } }));
+	is $after.status, 200, 'and the endpoint is still serving afterwards';
+};
+
+subtest 'A connection that cannot be probed never reports a disconnect' => {
+	plan 7;
+
+	# Mounted inside somebody else's Cro application -- behind TLS, or over
+	# HTTP/2 -- a request can arrive with a connection this transport has no way
+	# to question. That has to degrade to the behaviour handlers had before the
+	# probe existed (they run to completion and their answer is discarded)
+	# rather than to a cancellation nobody asked for, which would cut every long
+	# request short.
+	my &watch-disconnect = $http.^find_private_method('watch-disconnect');
+	ok &watch-disconnect.defined, 'the probe is where this test thinks it is';
+
+	my @unprobeable = Any, 'a connection of some other kind', 42;
+	my @watches = @unprobeable.map(-> $connection { watch-disconnect($http, $connection) });
+
+	# Long enough for several probes at the default quarter-second interval.
+	sleep 0.8;
+
+	for @watches.kv -> $i, ($cancelled, $tap) {
+		is $cancelled.status, Planned,
+			"a {@unprobeable[$i].^name} connection is never called cancelled";
+		lives-ok { $tap.close }, "...and it still hands back a tap that closes ({$i + 1}/3)";
+	}
+};
+
+subtest 'The transport refuses settings it cannot honour' => {
+	plan 8;
 
 	my sub dies-with(&code, Str:D $needle, Str:D $desc) {
 		my Str $message;
@@ -485,6 +628,9 @@ subtest 'The transport refuses settings it cannot honour' => {
 		'port must be between 1 and 65535', 'An out-of-range port is refused';
 	dies-with { MCP::Server::HTTP.new(:$server, :keepalive(0)) },
 		'keepalive must be greater than zero', 'A zero keepalive would busy-loop, so it is refused';
+	dies-with { MCP::Server::HTTP.new(:$server, :disconnect-poll(0)) },
+		'disconnect-poll must be greater than zero',
+		'A zero disconnect poll would busy-loop on the socket, so it is refused too';
 	dies-with { MCP::Server::HTTP.new(:$server, allowed-origins => [42,]) },
 		'Allowed origins must be strings or regexes', 'Origins have to be matchable';
 	dies-with { $http.start },

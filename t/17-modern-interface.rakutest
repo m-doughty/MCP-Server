@@ -197,7 +197,7 @@ subtest 'Concurrent modern requests do not cross-talk' => {
 			{
 				id => %resp<id>,
 				text => %resp<result><content>[0]<text>,
-				notified => @notifs.map({ $_<params><message> }).list,
+				notified => @notifs.map({ $_<params><data> }).list,
 			};
 		}
 	}

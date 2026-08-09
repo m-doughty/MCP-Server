@@ -3,7 +3,7 @@ use lib 'lib';
 use JSON::Fast;
 use MCP::Server;
 
-plan 8;
+plan 10;
 
 my $server = MCP::Server.new(:name<test>);
 
@@ -39,6 +39,32 @@ subtest 'tools-for-llm schema is correct' => {
 	is %weather<function><description>, 'Get weather for a location', 'Description';
 	is %weather<function><parameters><properties><location><type>, 'string', 'Param type';
 	ok %weather<function><parameters><required>.first(* eq 'location').defined, 'Required param';
+};
+
+subtest 'tools-for-llm is sorted by name, exactly as tools/list is' => {
+	plan 3;
+
+	# Registered out of alphabetical order on purpose: hash iteration order is not
+	# stable in Raku, so an unsorted bridge would put a model's declarations in a
+	# different order run to run -- and disagree with the catalogue a client built
+	# on tools/list publishes.
+	my $ordered = MCP::Server.new(:name<ordered>);
+	for <zebra apple Mango banana> -> $name {
+		$ordered.tool: $name, handler => -> :%args { $name };
+	}
+
+	my $names = $ordered.tools-for-llm.map({ $_<function><name> }).List;
+	is-deeply $names, <Mango apple banana zebra>.List,
+		'declarations come out sorted by name';
+
+	my %listed = $ordered.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	is-deeply $names, %listed<result><tools>.map({ $_<name> }).List,
+		'and in the same order tools/list sorts into';
+
+	is-deeply $ordered.tools-for-llm.map({ $_<function><name> }).List, $names,
+		'the order is stable between calls';
 };
 
 # === execute-tool-calls ===
@@ -129,6 +155,38 @@ subtest 'Execute invalid arguments and handler failures return error messages' =
 		'Invalid JSON error explains failure';
 	ok @results[1]<is_error>, 'Handler exception marked as error';
 	ok @results[1]<content>.contains('boom'), 'Handler exception message returned';
+};
+
+subtest 'Empty arguments mean no arguments, not a parse error' => {
+	plan 8;
+
+	# Models routinely send "" (and sometimes a blank line) as the arguments of a
+	# tool that takes none.  Answering that with "Invalid tool arguments JSON"
+	# tells the model its perfectly reasonable call was broken.
+	$server.tool: 'nullary',
+		description => 'Takes nothing',
+		params => {},
+		handler => -> :%args { "ran with {%args.elems} arguments" };
+
+	my @calls = (
+		{ id => 'e1', type => 'function', function => { name => 'nullary', arguments => '' } },
+		{ id => 'e2', type => 'function', function => { name => 'nullary', arguments => "  \n\t " } },
+		{ id => 'e3', type => 'function', function => { name => 'nullary' } },
+		{ id => 'e4', type => 'function', function => { name => 'nullary', arguments => 'null' } },
+	);
+	my @results = $server.execute-tool-calls(@calls);
+
+	nok @results[0]<is_error>, 'An empty arguments string is not an error';
+	is @results[0]<content>, 'ran with 0 arguments', 'The tool ran with an empty argument hash';
+	nok @results[1]<is_error>, 'Whitespace-only arguments are not an error either';
+	is @results[1]<content>, 'ran with 0 arguments', 'And they too become an empty hash';
+	nok @results[2]<is_error>, 'A missing arguments member was already fine and stays fine';
+	is @results[2]<content>, 'ran with 0 arguments', 'It runs the same way';
+
+	# Only *empty* is forgiven: a string that says something has to say a JSON
+	# object, or the model needs to hear that it did not.
+	ok @results[3]<is_error>, 'A non-empty string that is not an object is still an error';
+	is @results[3]<content>, 'Tool arguments must be a JSON object', '...and says so';
 };
 
 done-testing;

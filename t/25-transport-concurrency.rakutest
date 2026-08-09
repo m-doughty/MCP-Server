@@ -1,0 +1,135 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+use MCP::Server::Transport::Stdio;
+
+# Writes are the one part of a transport that is genuinely concurrent: the run
+# loop writes a response while a handler on another thread (or a background
+# flusher calling MCP::Server.notify) writes a notification. A JSON-RPC stream
+# has no way to resynchronise after a spliced line, so the framing has to hold
+# under that. This file is the regression guard for the lock that makes it hold.
+
+plan 3;
+
+constant THREADS = 8;
+constant PER-THREAD = 150;
+
+#| A message big enough to cross any plausible buffer boundary, so a write that
+#| is not indivisible has somewhere to tear.
+sub payload(Int:D $thread, Int:D $seq --> Str:D) {
+	format-message(notification('notifications/message', {
+		level => 'debug',
+		logger => "thread-$thread",
+		data => ('x' x 20_000) ~ ":$thread:$seq",
+	}));
+}
+
+subtest 'Stdio.write-message is indivisible under concurrent writers' => {
+	plan 4;
+
+	my $path = $*TMPDIR.add("mcp-server-write-race-{$*PID}.jsonl");
+	LEAVE { try $path.unlink }
+
+	my $transport = MCP::Server::Transport::Stdio.new;
+	my $handle = $path.open(:w);
+	{
+		# The transport writes to $*OUT, which a start block inherits from the
+		# scope that created it -- so every writer really is aimed at the one
+		# handle, which is the whole point of the exercise.
+		my $*OUT = $handle;
+		await (^THREADS).map: -> $thread {
+			start { $transport.write-message(payload($thread, $_)) for ^PER-THREAD }
+		};
+	}
+	$handle.close;
+
+	my @lines = $path.lines;
+	is @lines.elems, THREADS * PER-THREAD, 'Every message came out as exactly one line';
+
+	my $unparseable = @lines.grep({ !(try from-json($_)) }).elems;
+	is $unparseable, 0, 'And every line is a complete JSON object, not two spliced halves';
+
+	my @decoded = @lines.map({ from-json($_) });
+	is @decoded.grep({ $_<method> ne 'notifications/message' }).elems, 0,
+		'With its framing intact';
+	is-deeply
+		@decoded.map({ $_<params><data>.substr(20_000) }).sort.List,
+		(^THREADS).map(-> $t { (^PER-THREAD).map(-> $s { ":$t:$s" }).Slip }).sort.List,
+		'And nothing was lost or duplicated on the way';
+};
+
+subtest 'A writer never sees a partly written line' => {
+	plan 2;
+
+	# Same race, watched from the other side: one thread writes while another
+	# reads what has been written so far. Every complete line it sees must be
+	# parseable at the moment it sees it -- a torn write would show up here as a
+	# fragment even if the file ends up whole.
+	my class WatchedTransport does MCP::Server::Transport {
+		has Lock $!lock .= new;
+		has @.seen;
+
+		method read-message(--> Str) { Str }
+		method write-message(Str:D $msg) { $!lock.protect: { @!seen.push($msg) } }
+	}
+
+	my $transport = WatchedTransport.new;
+	await (^THREADS).map: -> $thread {
+		start { $transport.write-message(payload($thread, $_)) for ^20 }
+	};
+
+	is $transport.seen.elems, THREADS * 20, 'A conforming transport records every message once';
+	is $transport.seen.grep({ !(try from-json($_)) }).elems, 0, 'Each of them whole';
+};
+
+subtest 'MCP::Server.notify is safe to call from any thread' => {
+	plan 3;
+
+	my class RecordingTransport does MCP::Server::Transport {
+		has Lock $!lock .= new;
+		has @.inbound;
+		has @.written;
+
+		method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+		method write-message(Str:D $msg) { $!lock.protect: { @!written.push($msg) } }
+	}
+
+	my class ErrSink {
+		method say(*@args) { True }
+		method print(*@args) { True }
+		method flush(--> Bool:D) { True }
+	}
+
+	my $server = MCP::Server.new(:name<race-server>, :version<1.0.0>);
+	$server.tool: 'ping', :handler(-> :%args { 'pong' });
+	my $transport = RecordingTransport.new(inbound => (
+		{ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} },
+		{ jsonrpc => '2.0', method => 'notifications/initialized' },
+	).map({ to-json($_, :!pretty) }).Array);
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+	my Int $before = $transport.written.elems;
+
+	my @results = await (^THREADS).map: -> $thread {
+		start {
+			(^25).map(-> $seq {
+				my %params = level => 'info', logger => "thread-$thread", data => "$thread:$seq";
+				$server.notify(notification('notifications/message', %params));
+			}).all.so;
+		}
+	};
+	ok @results.all.so, 'Every notification reported itself delivered';
+
+	my @written = $transport.written[$before .. *].map({ from-json($_) });
+	is @written.elems, THREADS * 25, 'And every one of them reached the transport';
+	is-deeply
+		@written.map({ $_<params><data> }).sort.List,
+		(^THREADS).map(-> $t { (^25).map(-> $s { "$t:$s" }).Slip }).sort.List,
+		'Exactly once each, with nothing garbled';
+};

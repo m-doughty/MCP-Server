@@ -1,6 +1,7 @@
 use JSON::Fast;
 use MCP::Server::Protocol;
 use MCP::Server::Context;
+use MCP::Server::Elicitation;
 use MCP::Server::Tool;
 use MCP::Server::Resource;
 use MCP::Server::Prompt;
@@ -71,6 +72,15 @@ my regex mcp-tool-name { ^ <[A..Za..z0..9_\-]> ** 1..128 $ }
 # to legacy clients and answer METHOD_NOT_FOUND to modern ones.
 my constant MODERN-REMOVED-METHODS = Set.new(<initialize ping logging/setLevel>);
 
+# The only three methods a 2026-07-28 server may answer with input_required.
+# "Servers MUST NOT send InputRequiredResult responses on any other client
+# requests" -- so a handler for anything else has nowhere to put an answer, and
+# is never given an elicitation broker.
+my constant MRTR-METHODS = Set.new(<tools/call resources/read prompts/get>);
+
+# The resultType that says "I need something from you before I can finish".
+my constant RESULT-TYPE-INPUT-REQUIRED = 'input_required';
+
 # $*ERR is process-wide, so concurrent handlers (an HTTP transport's thread pool,
 # for instance) would otherwise shear each other's log lines.
 my $log-lock = Lock.new;
@@ -98,6 +108,34 @@ has Str:D @.protocol-versions = SUPPORTED-PROTOCOL-VERSIONS;
 has Int:D $.discovery-ttl-ms = 3_600_000;
 has CacheScope:D $.cache-scope = 'private';
 
+#| Where C<$*MCP-REQUEST-CONTEXT.elicit> goes when there is no MCP client to
+#| ask: the LLM bridge (C<execute-tool-calls>), a legacy-era client, or a
+#| handler called directly from your own code.  Takes an ElicitRequest
+#| (C<< { method => 'elicitation/create', params => { mode, message,
+#| requestedSchema } } >>) and returns an ElicitResult
+#| (C<< { action => 'accept'|'decline'|'cancel', content? } >>); anything else
+#| it returns is read as a decline.
+#|
+#| A modern client that declared the elicitation capability wins over this: the
+#| user at the other end of the protocol is a better answer than a callback in
+#| the server process.
+has &.on-elicit;
+
+#| Seconds a call parked mid-elicitation waits for its client to come back
+#| before it is abandoned and its handler unwound.  Five minutes: long enough
+#| for a human to read a dialog and think about it, short enough that a client
+#| that crashed does not hold the continuation for the life of the process.
+has Real:D $.elicitation-ttl = 300;
+
+#| How many calls may sit parked mid-elicitation at once.  A client that walks
+#| away from every question it is asked cannot grow the table past this.
+has Int:D $.max-pending-elicitations = 64;
+
+# Built on first use: a server nobody elicits from never allocates one, which
+# keeps the common case exactly as it was.
+has $!elicitations;
+has Lock $!elicitations-lock .= new;
+
 # Threshold set by a legacy client through logging/setLevel.  'debug' lets
 # everything through, which is what the server did before setLevel existed.
 has Str:D $!min-log-level = 'debug';
@@ -122,6 +160,14 @@ submethod TWEAK(:@tools) {
 
 	die "discovery-ttl-ms for MCP server '$!name' must be zero or more, got $!discovery-ttl-ms"
 		if $!discovery-ttl-ms < 0;
+
+	die "elicitation-ttl for MCP server '$!name' must be greater than zero seconds, "
+	  ~ "got $!elicitation-ttl"
+		if $!elicitation-ttl <= 0;
+
+	die "max-pending-elicitations for MCP server '$!name' must be at least one, "
+	  ~ "got $!max-pending-elicitations"
+		if $!max-pending-elicitations < 1;
 
 	self!load-tool-entry($_) for @tools;
 }
@@ -334,8 +380,12 @@ my sub http-config-from($section, $path --> Hash) {
 
 # === LLM tool bridge ===
 
+#| Sorted by name, like the C<tools/list> catalog above: hash iteration order is
+#| not stable in Raku, and a model's tool declarations end up in a prompt that is
+#| cached and compared.  It also means this agrees, entry for entry, with what a
+#| client built on top of C<tools/list> declares.
 method tools-for-llm(--> List) {
-	%!tools.values.map(-> $tool {
+	%!tools.values.sort(*.name).map(-> $tool {
 		{
 			type => 'function',
 			function => {
@@ -359,6 +409,11 @@ method execute-tool-calls(@tool-calls --> List) {
 
 		if $args ~~ Associative {
 			%arguments = $args.Hash;
+		} elsif $args.Str.trim eq '' {
+			# Models routinely send "" as the arguments of a tool that takes none.
+			# That is a call with no arguments, not a broken one, so it runs with
+			# the empty %arguments already declared above rather than coming back
+			# as a parse error the model cannot act on.
 		} else {
 			try {
 				my $parsed = from-json($args.Str);
@@ -380,6 +435,15 @@ method execute-tool-calls(@tool-calls --> List) {
 		if !$is-error {
 			if %!tools{$fn-name}:exists {
 				try {
+					# There is no request here -- the model is calling the tool
+					# through us, not through MCP -- but a handler that reaches
+					# for $*MCP-REQUEST-CONTEXT still deserves an object rather
+					# than an Any it will die on.  Legacy era, because nothing
+					# about this path is 2026-07-28, and carrying :on-elicit so
+					# a tool that asks the user can still be answered locally.
+					my $*MCP-REQUEST-CONTEXT = MCP::Server::Context.new(
+						era => 'legacy', local-elicit => &!on-elicit,
+					);
 					$result = %!tools{$fn-name}.call(%arguments);
 					CATCH {
 						default {
@@ -529,6 +593,7 @@ method !context-for(
 		client-capabilities => (%meta{META-CLIENT-CAPABILITIES} ~~ Associative
 			?? %meta{META-CLIENT-CAPABILITIES}.Hash !! {}),
 		emit => &notify,
+		local-elicit => &!on-elicit,
 		|($cancelled.defined ?? (:$cancelled) !! ()),
 	);
 }
@@ -573,28 +638,39 @@ method !dispatch(%msg, MCP::Server::Context:D $ctx --> Hash) {
 
 	my %response = do {
 		my $*MCP-REQUEST-CONTEXT = $ctx;
-		given $method {
-			when 'initialize'         { self!handle-initialize($id, %params) }
-			when 'server/discover'    { self!handle-discover($id) }
-			when 'ping'               { success-response($id, {}) }
-			when 'logging/setLevel'   { self!handle-set-level($id, %params) }
-			when 'tools/list'         { self!handle-tools-list($id, %params) }
-			when 'tools/call'         { self!handle-tools-call($id, %params) }
-			when 'resources/list'     { self!handle-resources-list($id, %params) }
-			when 'resources/read'     { self!handle-resources-read($id, %params) }
-			when 'prompts/list'       { self!handle-prompts-list($id, %params) }
-			when 'prompts/get'        { self!handle-prompts-get($id, %params) }
-			# Includes subscriptions/listen: this server emits no change
-			# notifications and advertises no listChanged, so it does not exist here.
-			default                   { error-response($id, METHOD_NOT_FOUND, "Method not found: $method") }
+
+		# A retry of a call this server parked mid-elicitation: same method,
+		# the original parameters, plus the answers and the opaque state we
+		# handed out.  It is picked off here rather than inside the per-method
+		# handlers because resuming does not re-run one — the handler never
+		# stopped, it is waiting for these answers.
+		if $modern && MRTR-METHODS{$method} && %params<requestState> ~~ Str:D {
+			self!resume-elicitation($id, $method, %params, $ctx);
+		} else {
+			given $method {
+				when 'initialize'         { self!handle-initialize($id, %params) }
+				when 'server/discover'    { self!handle-discover($id) }
+				when 'ping'               { success-response($id, {}) }
+				when 'logging/setLevel'   { self!handle-set-level($id, %params) }
+				when 'tools/list'         { self!handle-tools-list($id, %params) }
+				when 'tools/call'         { self!handle-tools-call($id, %params) }
+				when 'resources/list'     { self!handle-resources-list($id, %params) }
+				when 'resources/read'     { self!handle-resources-read($id, %params) }
+				when 'prompts/list'       { self!handle-prompts-list($id, %params) }
+				when 'prompts/get'        { self!handle-prompts-get($id, %params) }
+				# Includes subscriptions/listen: this server emits no change
+				# notifications and advertises no listChanged, so it does not exist here.
+				default                   { error-response($id, METHOD_NOT_FOUND, "Method not found: $method") }
+			}
 		}
 	};
 
 	return %response unless $modern;
 
 	# Single choke point for the modern result decorations: cache metadata first,
-	# then resultType and serverInfo.  MRTR is not implemented — this server never
-	# turns round and asks the client anything — so every result is 'complete'.
+	# then resultType and serverInfo.  A handler that asked the client something
+	# has already set resultType to 'input_required' and modern-envelope leaves
+	# it alone; everything else comes out 'complete'.
 	%response = self!cacheable-result($method, %params, %response);
 	modern-envelope(%response, server-info => self.server-info);
 }
@@ -603,12 +679,158 @@ method !speaks(Str:D $version --> Bool:D) {
 	@!protocol-versions.grep({ $_ eq $version }).elems > 0;
 }
 
+# === Elicitation (multi round-trip requests) ===
+
+#| How many calls are parked waiting for a client to answer an elicitation.
+#| Zero on a server nobody has ever elicited from — the table is built on first
+#| use.  For health endpoints and tests.
+method pending-elicitations(--> Int:D) {
+	my $table = $!elicitations-lock.protect: { $!elicitations };
+	$table.defined ?? $table.pending !! 0;
+}
+
+method !elicitation-table(--> MCP::Server::Elicitation::Table:D) {
+	$!elicitations-lock.protect: {
+		$!elicitations //= MCP::Server::Elicitation::Table.new(
+			ttl => $!elicitation-ttl,
+			max-pending => $!max-pending-elicitations,
+		);
+	}
+}
+
+# May this request's handler turn round and ask the client something?  Only if
+# the client said it could: a 2026-07-28 server MUST NOT ask for a capability it
+# was never told about, and the client stamps its capabilities into the _meta of
+# every request, retries included, so the answer is re-derived each round.
+method !may-elicit(MCP::Server::Context:D $ctx --> Bool:D) {
+	return False unless $ctx.era eq 'modern';
+	my $elicitation = $ctx.client-capabilities<elicitation>;
+	$elicitation ~~ Associative && ($elicitation<form>:exists);
+}
+
+# Run one handler with an elicitation broker bound to its context.
+#
+# The handler goes onto a thread of its own so it can block in await inside
+# .elicit while this thread carries the questions back to the client.  Awaiting
+# inside a start block suspends the continuation rather than pinning a pool
+# thread, so a parked call costs a data structure and nothing else.
+method !call-with-elicitation($id, Str:D $method, MCP::Server::Context:D $ctx, &run --> Hash) {
+	my $broker = MCP::Server::Elicitation::Broker.new(:$method);
+	$broker.begin-round($ctx);
+	my $handler-ctx = $ctx.with-broker($broker);
+
+	# The re-bind inside the start block is not decoration.  A start block does
+	# inherit the dynamic context it was created in -- but what is bound out
+	# here is the *request's* context, the one without a broker on it, and a
+	# handler that found that one would be told it has nobody to ask.  The
+	# handler's context has to be the innermost binding on its own thread.
+	my $work = start {
+		my $*MCP-REQUEST-CONTEXT = $handler-ctx;
+		run();
+	};
+
+	self!await-elicitation-round($id, $method, $work, $broker);
+}
+
+# Wait for whichever comes first: the handler finishing, or the handler asking
+# the client something.  Called once per round, from the request that started
+# the trip and from every retry after it.
+method !await-elicitation-round($id, Str:D $method, Promise:D $work, $broker --> Hash) {
+	await Promise.anyof($work, $broker.round-ready);
+
+	unless $work.status === Planned {
+		$broker.close;
+		return self!settled-result($id, $work);
+	}
+
+	# Parked.  From here on the handler's notifications and cancellation belong
+	# to whichever round claims it next, so this round's context is let go of
+	# before the token that resumes it is minted.
+	$broker.end-round;
+	my %requests = $broker.take-requests;
+	my $token = self!elicitation-table.park($broker, $work, :$method);
+
+	without $token {
+		# The table is full.  Refusing is the honest answer: the alternative is
+		# a queue nobody bounded.  The handler unwinds through its own error
+		# path, which for a tool call is an isError result naming the reason.
+		$broker.abandon('server elicitation capacity exceeded');
+		# anyof rather than a bare await: a handler that let something escape
+		# its own error handling is answered as an internal error below, not
+		# thrown out of the dispatcher at the transport.
+		await Promise.anyof($work);
+		return self!settled-result($id, $work);
+	}
+
+	success-response($id, {
+		resultType => RESULT-TYPE-INPUT-REQUIRED,
+		# Omitted rather than sent empty when the only question withdrew itself
+		# (a .elicit timeout) between waking us and being collected: the spec
+		# needs one of the two, and requestState is always there.
+		|(%requests.elems > 0 ?? (inputRequests => %requests) !! ()),
+		requestState => $token,
+	});
+}
+
+# Resume a parked call from the requestState the client echoed back.
+method !resume-elicitation($id, Str:D $method, %params, MCP::Server::Context:D $ctx --> Hash) {
+	my %parked = self!elicitation-table.claim(%params<requestState>, :$method);
+
+	# Unknown, already used, expired, or minted for a different method.  A plain
+	# error rather than a fresh attempt at the call: the continuation is gone,
+	# and re-running a handler that has already had its side effects is worse
+	# than telling the client the truth.  It is terminal by design — retrying an
+	# expired continuation can never succeed.
+	return error-response($id, INVALID_PARAMS, 'Unknown or expired requestState')
+		unless %parked<broker>:exists;
+
+	my $broker = %parked<broker>;
+	$broker.begin-round($ctx);
+
+	my $responses = %params<inputResponses>;
+	$broker.deliver(
+		($responses ~~ Associative ?? $responses.Hash !! {}),
+		warn => -> Str:D $message { self.log('warning', $message) },
+	);
+
+	self!await-elicitation-round($id, $method, %parked<work>, $broker);
+}
+
+# The answer of a handler that has stopped.  A broken promise means something
+# escaped the handler's own error handling, which is a server bug rather than a
+# tool failure, so it is reported as one.
+method !settled-result($id, Promise:D $work --> Hash) {
+	if $work.status === Kept {
+		my %response = $work.result;
+		# The handler built its answer around the id of the request that started
+		# the trip.  The round that finally carries it back is a different
+		# request with a different id -- the spec insists on that -- and
+		# JSON-RPC answers the request that asked.
+		%response<id> = $id;
+		return %response;
+	}
+
+	my $why = 'the handler failed';
+	with $work.cause { $why = .message.lines.head }
+	self.log('error', "Elicitation handler failed: $why");
+	error-response($id, INTERNAL_ERROR, $why);
+}
+
 #| 2026-07-28 requires cache metadata on the catalog listings and on resource
 #| reads.  Listings come out of registries frozen before run(), so they carry the
 #| server-wide TTL; a read runs arbitrary handler code, so it is uncacheable
 #| unless the resource that owns it says otherwise.
 method !cacheable-result(Str:D $method, %params, %response --> Hash) {
 	return %response if %response<error>:exists;
+
+	# An input_required intermediate is not the resource: it is a question
+	# about it, carrying a single-use continuation token.  Stamping it
+	# cacheable would invite a proxy to serve the question — and the token —
+	# to somebody else.
+	my $result = %response<result>;
+	return %response
+		if $result ~~ Associative
+			&& ($result<resultType> // '') eq RESULT-TYPE-INPUT-REQUIRED;
 
 	my Int $ttl-ms;
 	my Str $cache-scope;
@@ -634,11 +856,14 @@ method !cacheable-result(Str:D $method, %params, %response --> Hash) {
 
 #| Log a message at an RFC 5424 level.  It always reaches $*ERR; whether it also
 #| reaches the client depends on the era of the request in flight (if any).
-method log(Str:D $level, Str:D $message) {
+method log(Str:D $level, Str:D $message --> Nil) {
 	$log-lock.protect: { $*ERR.say("[MCP/$level] $message") };
 
+	# 'data' rather than 'message': LoggingMessageNotificationParams takes a
+	# level, an optional logger and a data payload of any JSON-serialisable
+	# shape.  A plain string is the simplest such payload.
 	my %notif = notification('notifications/message', {
-		level => $level, logger => $!name, message => $message,
+		level => $level, logger => $!name, data => $message,
 	});
 
 	my $ctx = $*MCP-REQUEST-CONTEXT;
@@ -647,19 +872,68 @@ method log(Str:D $level, Str:D $message) {
 		# A 2026-07-28 server MUST NOT send notifications/message for a request that
 		# did not opt in through _meta logLevel, and the emission is scoped to that
 		# request's channel, so it can never leak into another one.
-		$ctx.emit-notification(%notif) if $ctx.wants-log($level);
+		self.notify(%notif) if $ctx.wants-log($level);
 		return;
 	}
 
-	# Legacy rules, in a request or out of one: nothing before the client says it
-	# is initialized, nothing below the level it asked for.
-	return unless $!initialized && log-level-at-least($level, $!min-log-level);
-	return if $ctx.defined && $ctx.emit-notification(%notif);
+	# Legacy rules, in a request or out of one: nothing below the level the
+	# client asked for.  (Nothing before it says it is initialized, either --
+	# that gate lives in notify, which every legacy channel goes through.)
+	return unless log-level-at-least($level, $!min-log-level);
+	self.notify(%notif);
+	return;
+}
+
+#| Deliver a pre-built notification — C<< { method => ..., params => ... } >>,
+#| as C<MCP::Server::Protocol>'s C<notification> sub builds it — on whatever
+#| channel this server currently has.  Returns True when some channel took it.
+#|
+#|   use MCP::Server::Protocol;
+#|   $server.notify(notification('notifications/progress', {
+#|       progressToken => $token, progress => 3, total => 10,
+#|   }));
+#|
+#| Routing is the same as C<log>'s, and so is era-aware: inside a modern-era
+#| request it goes to that request's channel and nowhere else (undelivered, and
+#| False, when the request has no sink); otherwise it follows the legacy rules —
+#| nothing at all before the client has said it is initialized, then the
+#| request's own sink if there is one, then the shared transport, which is where
+#| a legacy session's out-of-band notifications belong.
+#|
+#| Two things C<log> does that this does not: it echoes to C<$*ERR>, and it
+#| applies the level gating (C<logging/setLevel> for legacy, C<_meta> C<logLevel>
+#| for modern).  Neither is right for every notification — a background job
+#| spraying its output over the host process's stderr is a bug, and
+#| C<notifications/progress> has no level to gate on.  So B<callers gate
+#| themselves>: a C<notifications/message> raised this way should be sent only
+#| when C<$*MCP-REQUEST-CONTEXT.wants-log($level)> says so, since the 2026-07-28
+#| rule that a server MUST NOT log for a request that did not opt in is not
+#| enforced here.
+#|
+#| Safe to call from any thread: the bundled transports serialise their writes
+#| (see C<MCP::Server::Transport>), and the HTTP endpoint serialises each
+#| request's stream.
+method notify(%notif --> Bool:D) {
+	# The only server state read here is the initialized flag and the transport
+	# handle, both written once by the run loop.  A caller on another thread can
+	# therefore see "not initialized yet" a moment after the client said it was,
+	# and drop that one notification -- which is the safe way round.
+	my $ctx = $*MCP-REQUEST-CONTEXT;
+
+	# Modern notifications are request-scoped by definition: with no sink on the
+	# context there is no channel this one could legitimately travel on, and the
+	# transport-wide fallback below would leak it into another request's stream.
+	return $ctx.emit-notification(%notif) if $ctx.defined && $ctx.era eq 'modern';
+
+	return False unless $!initialized;
+	return True if $ctx.defined && $ctx.emit-notification(%notif);
 
 	# Out of a request (or in one whose context has no sink of its own) legacy
 	# notifications go to the shared transport, which is where they belong: a
 	# legacy session only ever has one client on it.
-	$!transport.write-message(format-message(%notif)) if $!transport.defined;
+	return False unless $!transport.defined;
+	$!transport.write-message(format-message(%notif));
+	True;
 }
 
 # === Internal handlers ===
@@ -739,22 +1013,33 @@ method !handle-tools-call($id, %params --> Hash) {
 	my %arguments = %params<arguments> // {};
 	my $tool = %!tools{$name};
 
-	try {
-		my $result = $tool.call(%arguments);
-		if $result ~~ Str {
-			return success-response($id, tool-result($result));
-		} elsif $result ~~ List {
-			return success-response($id, tool-result-from-content($result));
-		} elsif $result ~~ Hash {
-			return success-response($id, $result);
-		}
-		return success-response($id, tool-result(~$result));
-		CATCH {
-			default {
-				return success-response($id, tool-result(.message, :is-error));
+	# The call itself, as a thunk: a client that can be asked questions runs it
+	# on a thread of its own so it can be parked mid-flight, and everybody else
+	# runs it right here, exactly as before.  A sub rather than a block so the
+	# early returns below still mean what they say.
+	my &run = sub (--> Hash) {
+		try {
+			my $result = $tool.call(%arguments);
+			if $result ~~ Str {
+				return success-response($id, tool-result($result));
+			} elsif $result ~~ List {
+				return success-response($id, tool-result-from-content($result));
+			} elsif $result ~~ Hash {
+				return success-response($id, $result);
+			}
+			return success-response($id, tool-result(~$result));
+			CATCH {
+				default {
+					return success-response($id, tool-result(.message, :is-error));
+				}
 			}
 		}
-	}
+	};
+
+	my $ctx = $*MCP-REQUEST-CONTEXT;
+	self!may-elicit($ctx)
+		?? self!call-with-elicitation($id, 'tools/call', $ctx, &run)
+		!! run();
 }
 
 method !handle-resources-list($id, %params --> Hash) {
@@ -772,15 +1057,23 @@ method !handle-resources-read($id, %params --> Hash) {
 		return error-response($id, INVALID_PARAMS, "Unknown resource: '$uri'");
 	}
 
-	try {
-		my %result = %!resources{$uri}.read;
-		return success-response($id, %result);
-		CATCH {
-			default {
-				return error-response($id, INTERNAL_ERROR, .message);
+	my $resource = %!resources{$uri};
+	my &run = sub (--> Hash) {
+		try {
+			my %result = $resource.read;
+			return success-response($id, %result);
+			CATCH {
+				default {
+					return error-response($id, INTERNAL_ERROR, .message);
+				}
 			}
 		}
-	}
+	};
+
+	my $ctx = $*MCP-REQUEST-CONTEXT;
+	self!may-elicit($ctx)
+		?? self!call-with-elicitation($id, 'resources/read', $ctx, &run)
+		!! run();
 }
 
 method !handle-prompts-list($id, %params --> Hash) {
@@ -800,15 +1093,23 @@ method !handle-prompts-get($id, %params --> Hash) {
 	) if %params<arguments>.defined && %params<arguments> !~~ Associative;
 
 	my %arguments = %params<arguments> // {};
+	my $prompt = %!prompts{$name};
 
-	try {
-		my %result = %!prompts{$name}.get(%arguments);
-		return success-response($id, %result);
-		CATCH {
-			default {
-				return error-response($id, INTERNAL_ERROR, .message);
+	my &run = sub (--> Hash) {
+		try {
+			my %result = $prompt.get(%arguments);
+			return success-response($id, %result);
+			CATCH {
+				default {
+					return error-response($id, INTERNAL_ERROR, .message);
+				}
 			}
 		}
-	}
+	};
+
+	my $ctx = $*MCP-REQUEST-CONTEXT;
+	self!may-elicit($ctx)
+		?? self!call-with-elicitation($id, 'prompts/get', $ctx, &run)
+		!! run();
 }
 }

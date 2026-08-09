@@ -1,0 +1,280 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Context;
+use MCP::Server::Elicitation;
+
+# The two halves of the elicitation machinery on their own, without a server
+# around them: the Broker (one parked call's rendezvous between the handler
+# thread and the dispatcher thread) and the Table (token -> parked call).
+# t/21 drives the same code through real requests; this file is where the
+# concurrency is pinned down, because a bug there is a hang rather than a wrong
+# answer and a hang is what a test suite must never be asked to diagnose.
+
+plan 7;
+
+constant TIMEOUT = 10;
+
+#| Await a promise, giving up loudly rather than blocking the suite forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise;
+}
+
+#| Wait until the broker has something to ask (or the handler has finished),
+#| which is exactly what the dispatcher does between rounds.
+sub next-round($work, $broker, Str:D $what = 'a question or an answer') {
+	timed(Promise.anyof($work, $broker.round-ready), $what);
+}
+
+sub elicit-request(Str:D $message --> Hash) {
+	{
+		method => 'elicitation/create',
+		params => {
+			mode => 'form',
+			message => $message,
+			requestedSchema => {
+				type => 'object',
+				properties => { name => { type => 'string' } },
+				required => ['name',],
+			},
+		},
+	};
+}
+
+sub broker(Str:D $method = 'tools/call') {
+	MCP::Server::Elicitation::Broker.new(:$method);
+}
+
+subtest 'One question goes out and one answer comes back' => {
+	plan 9;
+
+	my $b = broker();
+	is $b.method, 'tools/call', 'The broker remembers the method it was made for';
+	is $b.pending, 0, 'Nothing is outstanding before anybody asks';
+
+	my $work = start { $b.ask(elicit-request('Who are you?')) };
+	next-round($work, $b);
+
+	is $b.pending, 1, 'The handler registered its question';
+	my %requests = $b.take-requests;
+	is-deeply %requests.keys.List, ('q1',), 'Keys are server-assigned and start at q1';
+	is-deeply %requests<q1>, elicit-request('Who are you?'),
+		'The request travels verbatim -- the broker is a post box, not an editor';
+	is $b.pending, 1, 'Taking a question does not answer it';
+
+	$b.deliver({ q1 => { action => 'accept', content => { name => 'Ada' } } });
+	my %answer = await timed($work, 'the handler to be answered');
+	is-deeply %answer, { action => 'accept', content => { name => 'Ada' } },
+		'The handler gets the ElicitResult it was sent';
+	is $b.pending, 0, 'And the question is gone';
+
+	# A second, independent question on the same broker: keys are unique for the
+	# life of the call, so an answer can never land on the wrong question.
+	my $again = start { $b.ask(elicit-request('And again?')) };
+	next-round($again, $b);
+	is-deeply $b.take-requests.keys.List, ('q2',),
+		'The next question gets a key of its own rather than reusing q1';
+	$b.deliver({ q2 => { action => 'decline' } });
+	await timed($again, 'the second answer');
+};
+
+subtest 'Accept, decline and cancel are all ordinary answers' => {
+	plan 4;
+
+	for <accept decline cancel> -> $action {
+		my $b = broker();
+		my $work = start { $b.ask(elicit-request("$action?")) };
+		next-round($work, $b);
+		$b.deliver({ q1 => { action => $action, content => { name => 'x' } } });
+		my %answer = await timed($work, "an $action answer");
+		is %answer<action>, $action, "'$action' reaches the handler as an answer, not an exception";
+	}
+
+	# Content is only meaningful on an accept: a user who said no said nothing.
+	my $b = broker();
+	my $work = start { $b.ask(elicit-request('no?')) };
+	next-round($work, $b);
+	$b.deliver({ q1 => { action => 'decline', content => { name => 'ignored' } } });
+	nok (await timed($work, 'the decline'))<content>:exists,
+		'A refusal carries no content, whatever the client attached to it';
+};
+
+subtest 'Answers that do not fit are made to converge' => {
+	plan 7;
+
+	my @warnings;
+	my $b = broker();
+	my $work = start { $b.ask(elicit-request('shape?')) };
+	next-round($work, $b);
+
+	# A key nobody asked about cannot be delivered anywhere -- resolving some
+	# other question with it would be worse than ignoring it -- so it is
+	# reported and dropped.
+	$b.deliver({ nosuch => { action => 'accept' } }, warn => -> Str:D $m { @warnings.push($m) });
+	is @warnings.elems, 1, 'An unknown key is warned about';
+	ok @warnings[0].contains('nosuch'), 'The warning names the key';
+	ok @warnings[0].contains('tools/call'), 'And the call it did not belong to';
+	is $b.pending, 1, 'The real question is untouched by it';
+
+	# Nothing delivered for q1, so it is asked again: the spec says a server
+	# SHOULD re-ask a key the client left out, and a broker that dropped it
+	# instead would park a handler nobody could ever answer.
+	next-round($work, $b, 'the question to be re-offered');
+	is-deeply $b.take-requests.keys.List, ('q1',), 'An unanswered question comes round again';
+
+	$b.deliver({ q1 => 'not an ElicitResult at all' });
+	is-deeply (await timed($work, 'the coerced answer')), { action => 'decline' },
+		'A value that is not a result is a refusal, because refusing terminates and looping does not';
+
+	my $other = broker();
+	my $second = start { $other.ask(elicit-request('again?')) };
+	next-round($second, $other);
+	$other.deliver({ q1 => { action => 'sideways' } });
+	is-deeply (await timed($second, 'the coerced action')), { action => 'decline' },
+		'An action nobody has heard of is a refusal too';
+};
+
+subtest 'Several questions at once, answered a few at a time' => {
+	plan 6;
+
+	my $b = broker();
+	my $lock = Lock.new;
+	my @answers;
+
+	# Three handler threads on one call -- a tool that fans out and asks about
+	# each thing it found.  All three questions belong to the same round.
+	my @work = (1 .. 3).map(-> $i {
+		start {
+			my %a = $b.ask(elicit-request("question $i"));
+			$lock.protect: { @answers.push("$i:{%a<action>}") };
+			True;
+		}
+	});
+
+	# Wait until all three have registered; each one keeps round-ready, and the
+	# dispatcher only ever sees "there is something to ask".
+	my $all = Promise.allof(@work);
+	my $deadline = now + TIMEOUT;
+	until $b.pending == 3 || now > $deadline {
+		next-round($all, $b, 'three questions to pile up');
+		sleep 0.01;
+	}
+	is $b.pending, 3, 'All three questions are outstanding at once';
+
+	my %requests = $b.take-requests;
+	is-deeply %requests.keys.sort.List, <q1 q2 q3>.List, 'And all three go out in one round';
+	is-deeply %requests.values.map({ $_<params><message> }).sort.List,
+		('question 1', 'question 2', 'question 3').List, 'Each with its own message';
+
+	# A client that answers two of the three: the third handler stays parked and
+	# its question is re-offered.
+	my ($first, $second, $third) = %requests.keys.sort;
+	$b.deliver({ $first => { action => 'accept' }, $second => { action => 'decline' } });
+	next-round($all, $b, 'the remaining question');
+	is $b.pending, 1, 'The unanswered handler is still waiting';
+	is-deeply $b.take-requests.keys.List, ($third,), 'And only its question is asked again';
+
+	$b.deliver({ $third => { action => 'cancel' } });
+	timed($all, 'every handler to finish');
+	is @answers.elems, 3, 'Every handler was answered exactly once';
+};
+
+subtest 'Abandonment unwinds the handlers rather than stranding them' => {
+	plan 6;
+
+	my $b = broker();
+	nok $b.cancelled, 'A live broker is not cancelled';
+
+	my $work = start {
+		my $outcome = 'answered';
+		{
+			CATCH { default { $outcome = "threw: {.message}" } }
+			$b.ask(elicit-request('anybody there?'));
+		}
+		$outcome;
+	};
+	next-round($work, $b);
+
+	$b.abandon('the client did not come back');
+	my $outcome = await timed($work, 'the handler to unwind');
+	ok $outcome.starts-with('threw: '), 'The parked handler throws rather than blocking forever';
+	ok $outcome.contains('the client did not come back'), 'The exception names the reason';
+	ok $b.cancelled, 'And the broker reports the call as cancelled from then on';
+	is $b.pending, 0, 'Nothing is left outstanding';
+
+	# Asking again is refused rather than silently parking on a dead broker.
+	my $late = start { $b.ask(elicit-request('still?')) };
+	timed($late, 'a question asked after abandonment');
+	is $late.status, Broken, 'A question asked after abandonment fails at once';
+};
+
+subtest 'The table hands out tokens and takes them back exactly once' => {
+	plan 12;
+
+	my $table = MCP::Server::Elicitation::Table.new(ttl => 60, max-pending => 2);
+	is $table.pending, 0, 'A fresh table is empty';
+
+	my $b = broker();
+	my $work = start { True };
+	my $token = $table.park($b, $work, method => 'tools/call');
+	ok $token.defined, 'Parking a call mints a token';
+	is $table.pending, 1, 'And the call is on the table';
+
+	is-deeply $table.claim($token, method => 'prompts/get'), {},
+		'A token minted for tools/call cannot resume a prompts/get';
+	is $table.pending, 1, 'A mismatched claim leaves the entry for its rightful owner';
+
+	my %claimed = $table.claim($token, method => 'tools/call');
+	is %claimed<method>, 'tools/call', 'The right method claims it';
+	ok %claimed<broker> === $b, 'And gets the broker back';
+	is $table.pending, 0, 'Claiming takes it off the table';
+	is-deeply $table.claim($token, method => 'tools/call'), {},
+		'Tokens are single use: the second claim finds nothing';
+
+	# Capacity: the third park has nowhere to go, and says so rather than
+	# queueing behind a client that may never answer.
+	my $first = $table.park(broker(), start { True }, method => 'tools/call');
+	my $second = $table.park(broker(), start { True }, method => 'tools/call');
+	my $refused = $table.park(broker(), start { True }, method => 'tools/call');
+	ok $first.defined && $second.defined, 'The table fills to its cap';
+	nok $refused.defined, 'And refuses the one after that with an undefined token';
+
+	# Expiry: reaping is what makes the cap self-healing, and it abandons the
+	# broker so the handler behind it unwinds instead of leaking.
+	my $short = MCP::Server::Elicitation::Table.new(ttl => 0.2, max-pending => 1);
+	my $doomed = broker();
+	my $parked = start {
+		my $outcome = 'answered';
+		{
+			CATCH { default { $outcome = 'unwound' } }
+			$doomed.ask(elicit-request('?'));
+		}
+		$outcome;
+	};
+	next-round($parked, $doomed);
+	$short.park($doomed, $parked, method => 'tools/call');
+
+	# No claim, no park: only the timer scheduled by park() can clean this up.
+	await Promise.anyof($parked, Promise.in(TIMEOUT));
+	is-deeply ($short.pending, await timed($parked, 'the reaped handler')), (0, 'unwound'),
+		'A call nobody came back for is reaped on its own timer and its handler unwound';
+};
+
+subtest 'Tokens are opaque, unique and hard to guess' => {
+	plan 4;
+
+	my $table = MCP::Server::Elicitation::Table.new(ttl => 60, max-pending => 200);
+	my @tokens = (1 .. 50).map({ $table.park(broker(), start { True }, method => 'tools/call') });
+
+	is @tokens.grep(*.defined).elems, 50, 'Every park inside the cap got a token';
+	is @tokens.unique.elems, 50, 'No two calls ever share one';
+	ok @tokens.all ~~ / ^ 'mrtr-' \d+ '-' <[0..9a..f]> ** 32 $ /,
+		'Each is a serial plus 128 bits of randomness in hex';
+
+	my @random = @tokens.map({ .split('-')[2] });
+	is @random.unique.elems, 50,
+		'The random half is different every time -- the serial is not what makes it unguessable';
+};
+
+done-testing;

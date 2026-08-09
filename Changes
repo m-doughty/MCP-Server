@@ -2,6 +2,67 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.4.0  2026-08-09T19:42:11+01:00
+    - New public MCP::Server.notify(%notification): the delivery half of .log
+      on its own. Takes a whole notification hash (as
+      MCP::Server::Protocol's `notification` sub builds it), routes it exactly
+      as .log does -- a modern request's own channel, else the legacy rules
+      and the shared transport -- and returns True if some channel took it.
+      Unlike .log it never echoes to $*ERR and applies no level gating, so a
+      background worker can push progress or job output to a client without
+      spraying the host process's terminal; callers gate themselves against
+      $*MCP-REQUEST-CONTEXT.wants-log. .log now delegates its delivery to it,
+      with its echo and gating unchanged.
+    - Spec fix: notifications/message params now carry the log line as `data`
+      rather than `message`. LoggingMessageNotificationParams has always been
+      { level, logger?, data } -- the server was inventing a key, and a client
+      reading the spec's one (MCP::Client's on-log hook, among others) saw an
+      undefined payload.
+    - MCP::Server::Transport::Stdio now serialises write-message with a Lock,
+      and the Transport role documents that requirement: writes come from the
+      run loop and from any thread that logs or notifies, and a spliced line
+      is a stream a JSON-RPC client cannot resynchronise.
+    - Server-side elicitation: a tool, resource or prompt handler can now call
+      $*MCP-REQUEST-CONTEXT.elicit(...) to ask the human on the other end of
+      the client a question and block until they answer. This implements the
+      2026-07-28 multi round-trip request pattern (MRTR): the call is answered
+      with resultType "input_required", an inputRequests map and an opaque
+      requestState, and the client's retry resumes it. New
+      MCP::Server::Elicitation (Outcome / Broker / Table).
+    - The handler is parked rather than restarted: it keeps running on a thread
+      of its own and blocks in await, so nothing it has already done is done
+      twice. Only a modern-era request on tools/call, resources/read or
+      prompts/get from a client that declared the elicitation capability is
+      dispatched that way; every other request is handled exactly as before,
+      synchronously, on the caller's thread.
+    - New MCP::Server attributes: :&on-elicit (a local fallback for legacy
+      clients, the LLM bridge, or direct calls -- takes an ElicitRequest,
+      returns an ElicitResult), :$elicitation-ttl (default 300s) and
+      :$max-pending-elicitations (default 64), plus .pending-elicitations for
+      health checks. A wire client that can be asked always beats the callback.
+    - execute-tool-calls now binds a legacy-era $*MCP-REQUEST-CONTEXT around
+      each tool call. Tools that read the request context used to die on an
+      undefined dynamic variable when a model called them through the bridge.
+    - Modern results with resultType "input_required" are no longer stamped
+      with ttlMs/cacheScope: a question about a resource is not the resource,
+      and it carries a single-use continuation token.
+    - tools-for-llm now sorts its declarations by tool name, as tools/list
+      already did. Hash order is not stable in Raku, so the tool block a
+      model was shown could differ run to run -- and disagree with what a
+      client built on tools/list publishes for the same server.
+    - execute-tool-calls now treats an empty or whitespace-only arguments
+      string as "no arguments" rather than answering with an
+      "Invalid tool arguments JSON" error result. Models routinely send ""
+      as the arguments of a tool that takes none. Anything else that is not
+      a JSON object is still an error result.
+    - MCP::Server::HTTP now notices a client hanging up while a handler is
+      running, so $*MCP-REQUEST-CONTEXT.cancelled actually flips for the
+      case it exists to serve. Previously only a failing write told the
+      transport the client had gone, which for a quiet handler was when it
+      finally answered -- too late to cancel anything. New :$disconnect-poll
+      (default 0.25s) sets how often the client is checked on; the check is
+      a zero-byte write, so it puts nothing on the wire.
+
 0.3.0  2026-08-07T12:10:18+01:00
     - Toolkit system: new MCP::Server::Toolkit role plus
       $server.plug($kit, :prefix<...>) and the MCP::Server::Registrar facade.

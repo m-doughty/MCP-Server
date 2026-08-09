@@ -104,11 +104,11 @@ subtest 'Legacy logging reaches an initialized client' => {
 	my ($transport, $err) = play(noisy-server(), %init-request, %initialized, %noisy-call);
 	my @notifs = notifications($transport.messages);
 
-	ok @notifs.grep({ $_<params><message> eq 'Client initialized' }),
+	ok @notifs.grep({ $_<params><data> eq 'Client initialized' }),
 		'Out-of-request logging goes to the transport';
-	ok @notifs.grep({ $_<params><message> eq 'quiet detail' }), 'debug is emitted at the default level';
-	ok @notifs.grep({ $_<params><message> eq 'loud problem' }), 'error is emitted';
-	is @notifs.grep({ $_<params><message> eq 'loud problem' })[0]<params><logger>, 'log-server',
+	ok @notifs.grep({ $_<params><data> eq 'quiet detail' }), 'debug is emitted at the default level';
+	ok @notifs.grep({ $_<params><data> eq 'loud problem' }), 'error is emitted';
+	is @notifs.grep({ $_<params><data> eq 'loud problem' })[0]<params><logger>, 'log-server',
 		'Notifications name the logger';
 };
 
@@ -121,8 +121,8 @@ subtest 'Legacy logging respects the setLevel threshold' => {
 	);
 	my @notifs = notifications($transport.messages);
 
-	nok @notifs.grep({ $_<params><message> eq 'quiet detail' }), 'Below-threshold messages are dropped';
-	ok @notifs.grep({ $_<params><message> eq 'loud problem' }), 'At-threshold messages are kept';
+	nok @notifs.grep({ $_<params><data> eq 'quiet detail' }), 'Below-threshold messages are dropped';
+	ok @notifs.grep({ $_<params><data> eq 'loud problem' }), 'At-threshold messages are kept';
 	ok $err.lines.grep({ $_.contains('quiet detail') }),
 		'Dropped messages still reach stderr';
 };
@@ -143,7 +143,7 @@ subtest 'Modern per-request logging' => {
 			},
 			notify => -> %n { @notifs.push(%n) },
 		);
-		(%resp, @notifs.map({ $_<params><message> }).list);
+		(%resp, @notifs.map({ $_<params><data> }).list);
 	}
 
 	my (%opted-in, @opted-in) := call-with(:log-level<debug>);
@@ -176,8 +176,8 @@ subtest 'Modern notifications interleave ahead of the response on stdio' => {
 	my @messages = $transport.messages;
 
 	is @messages.elems, 3, 'Two notifications and one response were written';
-	is @messages[0]<params><message>, 'quiet detail', 'First notification comes first';
-	is @messages[1]<params><message>, 'loud problem', 'Second notification keeps its order';
+	is @messages[0]<params><data>, 'quiet detail', 'First notification comes first';
+	is @messages[1]<params><data>, 'loud problem', 'Second notification keeps its order';
 	ok @messages[2]<result><content>:exists, 'The response is written last';
 	is @messages[2]<id>, 2, 'The response belongs to the request';
 };
@@ -194,9 +194,9 @@ subtest 'Modern logging ignores the legacy gates' => {
 	my ($transport, $err) = play(noisy-server(), %init-request, %initialized, %modern-call);
 	my @notifs = notifications($transport.messages);
 
-	nok @notifs.grep({ $_<params><message> eq 'quiet detail' }),
+	nok @notifs.grep({ $_<params><data> eq 'quiet detail' }),
 		'No modern notification without a per-request opt-in';
-	ok @notifs.grep({ $_<params><message> eq 'Client initialized' }),
+	ok @notifs.grep({ $_<params><data> eq 'Client initialized' }),
 		'Legacy out-of-request logging on the same session is unaffected';
 };
 

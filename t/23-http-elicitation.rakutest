@@ -1,0 +1,238 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use Cro::HTTP::Client;
+use MCP::Server;
+use MCP::Server::HTTP;
+use MCP::Server::HTTP::Validation;
+use MCP::Server::Protocol;
+
+# Elicitation over the real Streamable HTTP transport.  t/21 proves the shapes;
+# this file proves the transport survives them -- parking a handler mid-request
+# blocks a thread that the transport is also using, on both the plain-JSON path
+# (where the route waits for the dispatch to return) and the SSE path (where it
+# waits for the handler and the notification channel at the same time).  A
+# deadlock in either is a hang, so every await here is bounded.
+
+plan 4;
+
+constant TIMEOUT = 30;
+
+#| Await $promise, giving up (loudly) rather than blocking forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise.result;
+}
+
+# === The server under test ===
+
+my $server = MCP::Server.new(:name<http-elicit>, :version<1.2.3>);
+
+$server.tool: 'ask', :description('Ask the user something'), :handler(-> :%args {
+	my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+		'Who is this for?',
+		properties => { who => { type => 'string', description => 'A name' } },
+		required => ['who',],
+	);
+	$answer.accepted ?? "for {$answer.content<who> // ''}" !! "for nobody ({$answer.action})";
+});
+
+# Says something first, so the answer is upgraded to a stream before the
+# handler parks -- the case where the transport is holding a live event stream
+# open across the gap between two requests.
+$server.tool: 'chatty-ask', :handler(-> :%args {
+	$server.log('info', 'thinking');
+	my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+		'Carry on?', properties => { go => { type => 'boolean' } },
+	);
+	$server.log('info', 'resumed');
+	"carried on ({$answer.action})";
+});
+
+# === Booting ===
+
+#| Start the endpoint on a random high port, retrying in case something else
+#| already owns the one we picked.  A real request is the only honest proof that
+#| the listener is ours and working.
+sub boot(--> List) {
+	my $last-error;
+	for ^5 {
+		my $port = (20000 .. 40000).pick;
+		my $http = MCP::Server::HTTP.new(:$server, :$port);
+		$http.start;
+
+		my %probe = jsonrpc => '2.0', id => 'probe', method => 'tools/list',
+			params => { _meta => { (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION } };
+		my $answered = Cro::HTTP::Client.new(:!persistent).post(
+			"http://127.0.0.1:$port/mcp",
+			content-type => 'application/json',
+			body => to-json(%probe, :!pretty),
+			headers => [
+				'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+				'Mcp-Method' => 'tools/list',
+			],
+		);
+		await Promise.anyof($answered, Promise.in(10));
+		return ($http, $port) if $answered.status === Kept;
+
+		$last-error = $answered.status === Broken ?? $answered.cause.message !! 'no answer';
+		try $http.stop;
+	}
+	die "Could not start the MCP HTTP endpoint on any of 5 random ports: $last-error";
+}
+
+my ($http, $port) = boot();
+LEAVE { try $http.stop }
+
+my $endpoint = "http://127.0.0.1:$port/mcp";
+
+# === Request helpers ===
+
+#| A modern tools/call body.  Client capabilities travel in the _meta of every
+#| request, retry included -- which is what makes the retry askable too.
+sub body($id, %params, Str :$log-level --> Hash) {
+	my %meta =
+		(META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION,
+		(META-CLIENT-CAPABILITIES) => { elicitation => { form => {} } };
+	%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+
+	my %p = %params;
+	%p<_meta> = %meta;
+	{ jsonrpc => '2.0', :$id, method => 'tools/call', params => %p };
+}
+
+sub post-msg(%msg, Str :$accept) {
+	my $client = Cro::HTTP::Client.new(:!persistent);
+	timed(
+		$client.post(
+			$endpoint,
+			content-type => 'application/json',
+			body => to-json(%msg, :!pretty),
+			headers => [
+				'MCP-Protocol-Version' => MODERN-PROTOCOL-VERSION,
+				'Mcp-Method' => %msg<method>,
+				'Mcp-Name' => encode-header-value(%msg<params><name>),
+				|($accept.defined ?? ('Accept' => $accept) !! ()),
+			],
+		),
+		"a response to {%msg<params><name>}",
+	);
+}
+
+#| Read an event stream to its close and return the decoded payload of every
+#| event.  Keepalive comments carry no data lines and drop out here.
+sub sse-events($response --> List) {
+	my $lock = Lock.new;
+	my $text = '';
+	my $closed = Promise.new;
+
+	my $tap = $response.body-byte-stream.tap(
+		-> $blob { $lock.protect: { $text ~= $blob.decode('utf-8') } },
+		done => { $closed.keep(True) },
+		quit => -> $error { $closed.break($error) },
+	);
+	timed($closed, 'the event stream to close');
+	$tap.close;
+
+	($lock.protect: { $text }).split("\n\n").grep(*.trim.chars > 0).map(-> $frame {
+		my @data = $frame.lines.grep(*.starts-with('data: ')).map(*.substr(6));
+		@data.elems > 0 ?? from-json(@data.join("\n")) !! Nil;
+	}).grep(*.defined).list;
+}
+
+#| The retry a client sends: the original params, this round's answers under
+#| the server's own keys, and the state echoed back untouched.
+sub retry-params(%original, %result, %answer --> Hash) {
+	my %params = %original;
+	my %responses;
+	%responses{$_} = %answer for (%result<inputRequests> // {}).keys;
+	%params<inputResponses> = %responses if %responses.elems > 0;
+	%params<requestState> = %result<requestState>;
+	%params;
+}
+
+# === Tests ===
+
+subtest 'A plain JSON POST can be answered with a question' => {
+	plan 6;
+
+	my %params = name => 'ask', arguments => {};
+	my $response = post-msg(body(1, %params));
+
+	is $response.status, 200, 'An input_required answer is a perfectly ordinary 200';
+	like $response.header('Content-type'), /^ 'application/json' /,
+		'A handler that only parked has nothing to stream';
+
+	my %result = timed($response.body, 'the first JSON body')<result>;
+	is %result<resultType>, 'input_required', 'The transport passes the result type through';
+	ok %result<requestState> ~~ Str:D, 'And the continuation token with it';
+	is %result<inputRequests>.values.head<params><message>, 'Who is this for?',
+		'The question survives serialisation';
+
+	is $server.pending-elicitations, 1, 'The call is parked while the client is away';
+};
+
+subtest 'The retry comes back over a second connection and finishes the call' => {
+	plan 4;
+
+	my %params = name => 'ask', arguments => {};
+	my %first = timed(post-msg(body(2, %params)).body, 'the parked round')<result>;
+
+	my $response = post-msg(body(3, retry-params(%params, %first, { action => 'accept', content => { who => 'Ada' } })));
+	is $response.status, 200, 'The retry is answered';
+
+	my %body = timed($response.body, 'the final JSON body');
+	is %body<id>, 3, 'The final result answers the retry';
+	is %body<result><content>[0]<text>, 'for Ada',
+		'The handler resumed on the far side of a whole HTTP round trip';
+	is %body<result><resultType>, 'complete', 'And this time it is complete';
+};
+
+subtest 'An event stream can carry a question as its last event' => {
+	plan 7;
+
+	my %params = name => 'chatty-ask', arguments => {};
+	my $response = post-msg(body(4, %params, :log-level<debug>), accept => 'text/event-stream');
+
+	is $response.status, 200, 'The stream starts with a 200';
+	like $response.header('Content-type'), /^ 'text/event-stream' /, 'Answered as SSE';
+
+	my @events = sse-events($response);
+	is @events.elems, 2, 'One notification and the question, then the stream closes';
+	is @events[0]<params><data>, 'thinking',
+		'The handler was heard from before it parked';
+
+	my %result = @events[1]<result>;
+	is %result<resultType>, 'input_required',
+		'And the stream closed on the question rather than hanging open';
+	ok %result<requestState> ~~ Str:D, 'Carrying the continuation token';
+
+	# The retry over its own stream: the second half of the handler runs there,
+	# so its log line belongs to that stream and not to the closed one.
+	my $resumed = post-msg(
+		body(5, retry-params(%params, %result, { action => 'accept', content => { go => True } }), :log-level<debug>),
+		accept => 'text/event-stream',
+	);
+	my @resumed-events = sse-events($resumed);
+	is-deeply @resumed-events.map({ $_<params><data> // $_<result><content>[0]<text> }).List,
+		('resumed', 'carried on (accept)').List,
+		'The resumed round streams its own log line and then the finished result';
+};
+
+subtest 'Nothing is left parked when the dust settles' => {
+	plan 2;
+
+	is $server.pending-elicitations, 1,
+		'Only the call from the first subtest, which was deliberately never answered';
+
+	# ...and answering it drains the table, which is the proof that a parked
+	# call is a data structure and a suspended continuation rather than a
+	# wedged transport thread.
+	my %params = name => 'ask', arguments => {};
+	my %first = timed(post-msg(body(6, %params)).body, 'another parked round')<result>;
+	timed(post-msg(body(7, retry-params(%params, %first, { action => 'decline' }))).body, 'its answer');
+	is $server.pending-elicitations, 1, 'The one that was answered let go of its place';
+};
+
+done-testing;

@@ -1,0 +1,511 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Server::Protocol;
+
+# Elicitation as a client sees it: whole requests in, whole responses out,
+# through handle-modern-request -- the same seam MCP::Server::HTTP uses.  The
+# wire shapes asserted here are the ones MCP-Client's t/06-mrtr.rakutest
+# demands of a server, so the two suites meet in the middle.
+
+plan 12;
+
+constant TIMEOUT = 20;
+
+#| Stand-in for $*ERR so handler log lines stay out of the TAP stream.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+#| A modern request.  Every 2026-07-28 client stamps its capabilities into the
+#| _meta of every request it sends, retries included, which is what lets the
+#| server re-derive "may I ask this client something?" on every round.
+sub modern(
+	$id, Str:D $method, %params, Bool:D :$caps = True, Str :$log-level --> Hash
+) {
+	my %meta = (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION;
+	%meta{META-CLIENT-CAPABILITIES} = { elicitation => { form => {} } } if $caps;
+	%meta{META-LOG-LEVEL} = $log-level if $log-level.defined;
+
+	my %full = %params;
+	%full<_meta> = %meta;
+	{ jsonrpc => '2.0', :$id, :$method, params => %full };
+}
+
+#| The retry a client builds from an input_required result: the B<original>
+#| parameters, this round's answers under this round's keys, and the state
+#| echoed back untouched.
+sub retry-params(%original, %result, @answers --> Hash) {
+	my %params = %original;
+	my @keys = (%result<inputRequests> // {}).keys.sort;
+	my %responses;
+	%responses{@keys[$_]} = @answers[$_] for ^min(@keys.elems, @answers.elems);
+	%params<inputResponses> = %responses if %responses.elems > 0;
+	%params<requestState> = %result<requestState> if %result<requestState>.defined;
+	%params;
+}
+
+sub accept(%content = {}) { { action => 'accept', content => %content } }
+
+# === The server under test ===
+
+sub fixture(*%opts --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<elicit-test>, :version<4.0.0>, |%opts);
+
+	# Asks one question and reports what came back.
+	$server.tool: 'ask-name', :description('Ask the user their name'), :handler(-> :%args {
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			%args<message> // 'What is your name?',
+			properties => {
+				name => { type => 'string', description => 'Your name' },
+				shout => { type => 'boolean' },
+			},
+			required => ['name',],
+		);
+		$answer.accepted
+			?? "hello {$answer.content<name> // ''}"
+			!! "no answer ({$answer.action})";
+	});
+
+	# Three questions, one per round: the multi-round case, and the one that
+	# proves answers do not accumulate.
+	$server.tool: 'interview', :handler(-> :%args {
+		my @said;
+		for <first second third> -> $which {
+			my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+				"$which question",
+				properties => { reply => { type => 'string' } },
+				required => ['reply',],
+			);
+			@said.push("$which={$answer.content<reply> // $answer.action}");
+		}
+		@said.join(' ');
+	});
+
+	# Two questions in one round, from two threads: the partial-answer case.
+	$server.tool: 'two-at-once', :handler(-> :%args {
+		my @work = <alpha beta>.map(-> $which {
+			start {
+				my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+					"$which?", properties => { reply => { type => 'string' } },
+				);
+				"$which={$answer.action}";
+			}
+		});
+		(await Promise.allof(@work)) && @work.map(*.result).sort.join(' ');
+	});
+
+	# Says something before and after the question, so each round's channel can
+	# be checked separately.
+	$server.tool: 'noisy-ask', :handler(-> :%args {
+		my &line = -> Str:D $text {
+			with $*MCP-REQUEST-CONTEXT {
+				.emit-notification(notification('notifications/message', {
+					level => 'info', logger => 'elicit-test', data => $text,
+				})) if .wants-log('info');
+			}
+		};
+
+		line('before');
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			'anything to say?', properties => { reply => { type => 'string' } },
+		);
+		line('after');
+		"said {$answer.action}";
+	});
+
+	# Reports whether the round it resumed into has been cancelled.
+	$server.tool: 'watchful', :handler(-> :%args {
+		$*MCP-REQUEST-CONTEXT.elicit(
+			'still there?', properties => { reply => { type => 'string' } },
+		);
+		"cancelled: {$*MCP-REQUEST-CONTEXT.cancelled}";
+	});
+
+	# Which thread the handler ran on, so "no elicitation means no thread" is
+	# provable rather than assumed.
+	$server.tool: 'which-thread', :handler(-> :%args { $*THREAD.id.Str });
+
+	$server.resource: 'mem://letter', :name<letter>, :ttl-ms(60_000), :cache-scope<public>,
+		:handler(-> :%args {
+			my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+				'Whom is the letter for?',
+				properties => { who => { type => 'string' } },
+				required => ['who',],
+			);
+			"Dear {$answer.accepted ?? $answer.content<who> !! 'nobody'},";
+		});
+
+	$server.prompt: 'greet', :handler(-> :%args {
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			'How formal?',
+			properties => { tone => { type => 'string', enum => <formal casual>.List } },
+		);
+		{
+			description => "a {$answer.accepted ?? $answer.content<tone> !! 'plain'} greeting",
+			messages => [{ role => 'user', content => { type => 'text', text => 'hi' } },],
+		};
+	});
+
+	$server;
+}
+
+subtest 'A handler that asks answers with input_required' => {
+	plan 10;
+
+	my $server = fixture();
+	my %params = name => 'ask-name', arguments => {};
+	my %response = $server.handle-modern-request(modern(1, 'tools/call', %params));
+
+	is %response<id>, 1, 'The response answers the request that asked';
+	my %result = %response<result>;
+	is %result<resultType>, 'input_required', 'The result says it needs something first';
+	ok %result<requestState> ~~ Str:D, 'It carries an opaque continuation token';
+	ok %result<_meta>{META-SERVER-INFO}:exists, 'The modern envelope is still applied';
+
+	is-deeply %result<inputRequests>.keys.List, ('q1',),
+		'inputRequests is a map keyed by a server-assigned id';
+	my %request = %result<inputRequests><q1>;
+	is %request<method>, 'elicitation/create', 'The question is an ElicitRequest';
+	is %request<params><mode>, 'form', 'In form mode';
+	is %request<params><message>, 'What is your name?', 'Carrying the handler\'s message';
+	is-deeply %request<params><requestedSchema>, {
+		type => 'object',
+		properties => {
+			name => { type => 'string', description => 'Your name' },
+			shout => { type => 'boolean' },
+		},
+		required => ['name',],
+	}, 'And the schema the handler described';
+
+	# A question about a result is not the result: caching it would let a proxy
+	# hand somebody else a single-use continuation token.
+	nok (%result<ttlMs>:exists) || (%result<cacheScope>:exists),
+		'An input_required intermediate carries no cache metadata';
+
+	$server.handle-modern-request(modern(2, 'tools/call',
+		retry-params(%params, %result, [accept({ name => 'x' }),])));
+};
+
+subtest 'The retry finishes the call' => {
+	plan 6;
+
+	my $server = fixture();
+	my %params = name => 'ask-name', arguments => {};
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	is $server.pending-elicitations, 1, 'The call is parked while the client thinks';
+
+	my %retry = retry-params(%params, %first, [accept({ name => 'Ada' }),]);
+	is-deeply %retry<inputResponses>.keys.List, ('q1',),
+		'The answers go back under the keys the server chose';
+	is %retry<requestState>, %first<requestState>, 'And the state comes back byte for byte';
+
+	my %response = $server.handle-modern-request(modern(2, 'tools/call', %retry));
+	is %response<id>, 2, 'The final result answers the retry, not the request that started it';
+	is %response<result><resultType>, 'complete', 'And it is complete';
+	is %response<result><content>[0]<text>, 'hello Ada',
+		'The handler carried on from where it was parked, with the answer in hand';
+};
+
+subtest 'Three rounds, each asking something new' => {
+	plan 6;
+
+	my $server = fixture();
+	my %params = name => 'interview', arguments => {};
+	my @messages;
+	my @tokens;
+
+	my %result = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	my $id = 1;
+	while %result<resultType> eq 'input_required' {
+		@messages.push(%result<inputRequests>.values.map({ $_<params><message> }).Slip);
+		@tokens.push(%result<requestState>);
+		%result = $server.handle-modern-request(modern(
+			++$id, 'tools/call',
+			retry-params(%params, %result, [accept({ reply => "answer $id" }),]),
+		))<result>;
+	}
+
+	is @messages.elems, 3, 'It took three rounds';
+	is-deeply @messages, ['first question', 'second question', 'third question'],
+		'Each round asked the next question';
+	is @tokens.unique.elems, 3, 'Every round minted a fresh token';
+	is %result<content>[0]<text>, 'first=answer 2 second=answer 3 third=answer 4',
+		'And every answer reached the handler that asked for it';
+	is %result<resultType>, 'complete', 'The last round completes';
+	is $server.pending-elicitations, 0, 'Nothing is left parked';
+};
+
+subtest 'Refusals reach the handler as answers' => {
+	plan 4;
+
+	for <decline cancel> -> $action {
+		my $server = fixture();
+		my %params = name => 'ask-name', arguments => {};
+		my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+		my %result = $server.handle-modern-request(modern(2, 'tools/call',
+			retry-params(%params, %first, [{ action => $action },])))<result>;
+
+		is %result<content>[0]<text>, "no answer ($action)",
+			"A $action is delivered to the handler rather than failing the call";
+		nok %result<isError>, "And a $action is not an error" if $action eq 'cancel';
+	}
+
+	# A client that answers with something that is not an ElicitResult at all
+	# has, in substance, refused: the alternative is asking again forever.
+	my $server = fixture();
+	my %params = name => 'ask-name', arguments => {};
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	my %result = $server.handle-modern-request(modern(2, 'tools/call',
+		retry-params(%params, %first, ['nonsense',])))<result>;
+	is %result<content>[0]<text>, 'no answer (decline)',
+		'Nonsense in an inputResponses value is read as a refusal';
+};
+
+subtest 'A client that cannot be asked is never asked' => {
+	plan 7;
+
+	# No elicitation capability in _meta: the 2026-07-28 rule is that a server
+	# MUST NOT ask for a capability it was not told about, so the handler is
+	# told it cannot rather than the client being asked anyway.
+	my $server = fixture();
+	my %result = $server.handle-modern-request(
+		modern(1, 'tools/call', { name => 'ask-name', arguments => {} }, :!caps),
+	)<result>;
+	is %result<resultType>, 'complete', 'The call answers in one round';
+	ok %result<isError>, 'With an error result';
+	ok %result<content>[0]<text>.contains('did not declare the elicitation capability'),
+		'Naming the reason in terms the server author can act on';
+	is $server.pending-elicitations, 0, 'And nothing was parked';
+
+	# A legacy client cannot be asked either: the whole pattern is 2026-07-28.
+	my $*ERR = ErrSink.new;
+	my %legacy = $server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/call',
+		params => { name => 'ask-name', arguments => {} },
+	})<result>;
+	ok %legacy<isError>, 'A legacy request gets an error result too';
+	ok %legacy<content>[0]<text>.contains('needs a 2026-07-28 client'),
+		'Pointing at the two ways to fix it';
+
+	# And a client that will not be asked pays nothing for the machinery: its
+	# handler runs on the thread that dispatched it, exactly as before.
+	my %sync = $server.handle-modern-request(
+		modern(3, 'tools/call', { name => 'which-thread', arguments => {} }, :!caps),
+	)<result>;
+	is %sync<content>[0]<text>, $*THREAD.id.Str,
+		'A call from a client that cannot elicit stays on the caller\'s thread';
+};
+
+subtest 'A continuation can only be resumed once, and only while it lasts' => {
+	plan 6;
+
+	my $server = fixture();
+	my %params = name => 'ask-name', arguments => {};
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	my %retry = retry-params(%params, %first, [accept({ name => 'Ada' }),]);
+
+	my %invented = %params;
+	%invented<requestState> = 'mrtr-9999-deadbeef';
+	my %unknown = $server.handle-modern-request(modern(2, 'tools/call', %invented));
+	is %unknown<error><code>, INVALID_PARAMS, 'An unknown token is -32602';
+	is %unknown<error><message>, 'Unknown or expired requestState',
+		'And says so plainly: retrying it could never succeed';
+
+	ok $server.handle-modern-request(modern(3, 'tools/call', %retry))<result><content>,
+		'The real token resumes the call';
+	my %reused = $server.handle-modern-request(modern(4, 'tools/call', %retry));
+	is %reused<error><code>, INVALID_PARAMS, 'Reusing it afterwards is refused: tokens are single use';
+
+	# Expiry: a server whose TTL has run out has already unwound the handler, so
+	# the token names nothing.
+	my $brief = fixture(elicitation-ttl => 0.3);
+	my %brief-params = name => 'ask-name', arguments => {};
+	my %parked = $brief.handle-modern-request(modern(1, 'tools/call', %brief-params))<result>;
+	sleep 0.8;
+	is $brief.pending-elicitations, 0, 'An abandoned call is reaped off the table';
+	is $brief.handle-modern-request(modern(2, 'tools/call',
+		retry-params(%brief-params, %parked, [accept({ name => 'late' }),])))<error><code>,
+		INVALID_PARAMS, 'And its token is refused when the client finally comes back';
+};
+
+subtest 'A token is pinned to the method that minted it' => {
+	plan 3;
+
+	my $server = fixture();
+	my %params = name => 'ask-name', arguments => {};
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	my $state = %first<requestState>;
+
+	my %wrong = $server.handle-modern-request(modern(2, 'prompts/get',
+		{ name => 'greet', arguments => {}, requestState => $state }));
+	is %wrong<error><code>, INVALID_PARAMS,
+		'A tools/call continuation cannot be resumed through prompts/get';
+
+	my %also-wrong = $server.handle-modern-request(modern(3, 'resources/read',
+		{ uri => 'mem://letter', requestState => $state }));
+	is %also-wrong<error><code>, INVALID_PARAMS, 'Nor through resources/read';
+
+	is $server.handle-modern-request(modern(4, 'tools/call',
+		retry-params(%params, %first, [accept({ name => 'Ada' }),])))<result><content>[0]<text>,
+		'hello Ada', 'The rightful method still finds it waiting';
+};
+
+subtest 'resources/read and prompts/get go round the loop too' => {
+	plan 8;
+
+	my $server = fixture();
+
+	my %read-params = uri => 'mem://letter';
+	my %read-first = $server.handle-modern-request(
+		modern(1, 'resources/read', %read-params),
+	)<result>;
+	is %read-first<resultType>, 'input_required', 'A resource read can ask a question';
+	nok %read-first<ttlMs>:exists,
+		'And the question is not stamped with the resource\'s cacheability';
+
+	my %read = $server.handle-modern-request(modern(2, 'resources/read',
+		retry-params(%read-params, %read-first, [accept({ who => 'Ada' }),])))<result>;
+	is %read<contents>[0]<text>, 'Dear Ada,', 'The read completes with the answer in it';
+	is %read<ttlMs>, 60_000, 'The final round carries the resource\'s TTL';
+	is %read<cacheScope>, 'public', 'And its cache scope';
+
+	my %prompt-params = name => 'greet', arguments => {};
+	my %prompt-first = $server.handle-modern-request(
+		modern(3, 'prompts/get', %prompt-params),
+	)<result>;
+	is %prompt-first<resultType>, 'input_required', 'A prompt render can ask a question';
+	is %prompt-first<inputRequests><q1><params><requestedSchema><properties><tone><enum>.List,
+		<formal casual>.List, 'An enum property survives into the schema';
+
+	my %prompt = $server.handle-modern-request(modern(4, 'prompts/get',
+		retry-params(%prompt-params, %prompt-first, [accept({ tone => 'formal' }),])))<result>;
+	is %prompt<description>, 'a formal greeting', 'The prompt completes with the answer in it';
+};
+
+subtest 'A round that answers only some of the questions' => {
+	plan 5;
+
+	my $server = fixture();
+	my %params = name => 'two-at-once', arguments => {};
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+
+	is %first<inputRequests>.elems, 2, 'Two handlers asked in the same round';
+	my @keys = %first<inputRequests>.keys.sort;
+
+	# Answer one of the two, as a client whose user closed one dialog would.
+	my %partial = %params;
+	%partial<inputResponses> = { @keys[0] => accept() };
+	%partial<requestState> = %first<requestState>;
+
+	my %second = $server.handle-modern-request(modern(2, 'tools/call', %partial))<result>;
+	is %second<resultType>, 'input_required', 'The call is still not finished';
+	is-deeply %second<inputRequests>.keys.List, (@keys[1],),
+		'And only the unanswered question is asked again -- by the key it already had';
+	isnt %second<requestState>, %first<requestState>, 'Under a fresh token';
+
+	my %done = $server.handle-modern-request(modern(3, 'tools/call',
+		retry-params(%params, %second, [{ action => 'decline' },])))<result>;
+	is %done<content>[0]<text>, 'alpha=accept beta=decline',
+		'Both handlers got their own answer in the end';
+};
+
+subtest 'Each round\'s notifications go to that round\'s channel' => {
+	plan 6;
+
+	my $server = fixture();
+	my %params = name => 'noisy-ask', arguments => {};
+
+	my @round-one;
+	my %first = $server.handle-modern-request(
+		modern(1, 'tools/call', %params, :log-level<debug>),
+		notify => -> %n { @round-one.push(%n) },
+	)<result>;
+	is-deeply @round-one.map({ $_<params><data> }).List, ('before',),
+		'What the handler said before it asked went out on the round that asked';
+
+	my @round-two;
+	my %second = $server.handle-modern-request(
+		modern(2, 'tools/call', retry-params(%params, %first, [accept(),]), :log-level<debug>),
+		notify => -> %n { @round-two.push(%n) },
+	)<result>;
+	is %second<content>[0]<text>, 'said accept', 'The call finished on the second round';
+	is-deeply @round-two.map({ $_<params><data> }).List, ('after',),
+		'And what it said afterwards went out on the round that resumed it';
+	is @round-one.elems, 1, 'Nothing leaked backwards into the first round\'s sink';
+
+	# logLevel is per request, so a retry that does not opt in hears nothing --
+	# even though the round that parked the call did.
+	my @quiet;
+	my %quiet-first = $server.handle-modern-request(
+		modern(3, 'tools/call', %params, :log-level<debug>),
+		notify => -> %n { @quiet.push(%n) },
+	)<result>;
+	my @quiet-two;
+	$server.handle-modern-request(
+		modern(4, 'tools/call', retry-params(%params, %quiet-first, [accept(),])),
+		notify => -> %n { @quiet-two.push(%n) },
+	);
+	is @quiet.elems, 1, 'The opted-in round still heard its line';
+	is @quiet-two.elems, 0, 'A retry that did not opt in to logging hears nothing';
+};
+
+subtest 'Cancellation belongs to the round in flight' => {
+	plan 3;
+
+	my $server = fixture();
+	my %params = name => 'watchful', arguments => {};
+
+	# The request that carried the call in is answered the moment the call
+	# parks, so its stream closing afterwards is the normal course of events --
+	# consulting it would cancel every elicitation ever made over HTTP.
+	my $gone = Promise.new;
+	my %first = $server.handle-modern-request(
+		modern(1, 'tools/call', %params), cancelled => $gone,
+	)<result>;
+	$gone.keep(True);
+
+	my %resumed = $server.handle-modern-request(
+		modern(2, 'tools/call', retry-params(%params, %first, [accept(),])),
+	)<result>;
+	is %resumed<content>[0]<text>, 'cancelled: False',
+		'The original request hanging up does not cancel the call it already answered';
+
+	# The round actually in flight is a different matter.
+	my %second = $server.handle-modern-request(modern(3, 'tools/call', %params))<result>;
+	my $hung-up = Promise.new;
+	$hung-up.keep(True);
+	my %cancelled = $server.handle-modern-request(
+		modern(4, 'tools/call', retry-params(%params, %second, [accept(),])),
+		cancelled => $hung-up,
+	)<result>;
+	is %cancelled<content>[0]<text>, 'cancelled: True',
+		'A client that hangs up on the round in flight does reach the handler';
+
+	is $server.pending-elicitations, 0, 'Both calls finished rather than lingering';
+};
+
+subtest 'The table has a cap, and refusing is an answer' => {
+	plan 4;
+
+	my $*ERR = ErrSink.new;
+	my $server = fixture(max-pending-elicitations => 1);
+	my %params = name => 'ask-name', arguments => {};
+
+	my %first = $server.handle-modern-request(modern(1, 'tools/call', %params))<result>;
+	is %first<resultType>, 'input_required', 'The first call parks';
+	is $server.pending-elicitations, 1, 'Filling the table';
+
+	my %refused = $server.handle-modern-request(modern(2, 'tools/call', %params))<result>;
+	ok %refused<isError> && %refused<content>[0]<text>.contains('capacity exceeded'),
+		'The next one is refused rather than queued behind it, and the handler is unwound';
+
+	is $server.handle-modern-request(modern(3, 'tools/call',
+		retry-params(%params, %first, [accept({ name => 'Ada' }),])))<result><content>[0]<text>,
+		'hello Ada', 'The call that did get a place is unaffected';
+};
+
+done-testing;

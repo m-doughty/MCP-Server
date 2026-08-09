@@ -1,0 +1,247 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Context;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+
+# MCP::Server.notify is the delivery half of .log with the opinions taken out:
+# no $*ERR echo, no level gating, a whole notification hash rather than a level
+# and a string. Everything here is about which channel a notification lands on
+# (and which it must never land on), so the transport and stderr are both fakes
+# that record instead of writing.
+
+plan 8;
+
+#| Transport that plays a canned script of inbound lines and records everything
+#| the server writes, in order.
+class ScriptedTransport does MCP::Server::Transport {
+	has @.inbound;
+	has @.written;
+
+	method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+	method write-message(Str:D $msg) { @!written.push($msg) }
+	method messages(--> List) { @!written.map({ from-json($_) }).list }
+}
+
+#| Stand-in for $*ERR so log lines land in an array instead of the test output.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+sub notifications(@messages --> List) {
+	@messages.grep({ ($_<method>:exists) && $_<method> eq 'notifications/message' }).list;
+}
+
+my %init-request = jsonrpc => '2.0', id => 1, method => 'initialize', params => {};
+my %initialized = jsonrpc => '2.0', method => 'notifications/initialized';
+
+#| Run a whole stdio session against a scripted transport, capturing stderr, and
+#| hand back the server with its transport still bound — which is the state
+#| .notify is normally called in from outside a request.
+sub session(**@messages --> List) {
+	my $server = MCP::Server.new(:name<notify-server>, :version<1.0.0>);
+	$server.tool: 'ping', :handler(-> :%args { 'pong' });
+	my $transport = ScriptedTransport.new(inbound => @messages.map({ to-json($_, :!pretty) }).Array);
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+	($server, $transport);
+}
+
+sub a-note(Str:D $text, Str:D $level = 'debug' --> Hash) {
+	notification('notifications/message', { level => $level, logger => 'unit', data => $text });
+}
+
+subtest 'A modern request gets its notification on its own channel' => {
+	plan 5;
+
+	my ($server, $transport) = session(%init-request, %initialized);
+	my Int $before = $transport.written.elems;
+
+	my @sunk;
+	my $ctx = MCP::Server::Context.new(
+		era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+		emit => -> %notif { @sunk.push(%notif) },
+	);
+
+	my $delivered = do { my $*MCP-REQUEST-CONTEXT = $ctx; $server.notify(a-note('modern')) };
+	ok $delivered, 'The request sink took it';
+	is @sunk.elems, 1, 'Exactly once';
+	is @sunk[0]<params><data>, 'modern', 'With the notification passed through as built';
+	is $transport.written.elems, $before,
+		'And nothing went to the transport, where another request could have read it';
+
+	# No sink means no channel: a modern notification is request-scoped, so the
+	# transport-wide fallback would be a leak rather than a rescue.
+	my $sinkless = MCP::Server::Context.new(
+		era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+	);
+	my $out = do { my $*MCP-REQUEST-CONTEXT = $sinkless; $server.notify(a-note('nowhere')) };
+	nok $out, 'A modern context with no sink reports the notification undelivered';
+};
+
+subtest 'Outside a request, legacy notifications go to the transport' => {
+	plan 4;
+
+	my ($server, $transport) = session(%init-request, %initialized);
+	my Int $before = $transport.written.elems;
+
+	ok $server.notify(a-note('out of band')), 'Delivered';
+	is $transport.written.elems, $before + 1, 'As exactly one write';
+
+	# Framed the way the run loop frames a response: one newline-terminated line,
+	# whatever order the JSON encoder happened to put the keys in.
+	my $line = $transport.written.tail;
+	is $line.comb("\n").elems, 1, 'Newline-framed, and a single line';
+	is-deeply from-json($line), {
+			jsonrpc => '2.0', method => 'notifications/message',
+			params => { level => 'debug', logger => 'unit', data => 'out of band' },
+		},
+		'And it is the caller\'s hash on the wire, untouched';
+};
+
+subtest 'Nothing is sent before the client says it is initialized' => {
+	plan 3;
+
+	# An initialize request answered, but no notifications/initialized: the
+	# legacy handshake is not finished, so the server may not speak unasked.
+	my ($server, $transport) = session(%init-request);
+	my Int $before = $transport.written.elems;
+
+	nok $server.notify(a-note('too early')), 'Reported undelivered';
+	is $transport.written.elems, $before, 'And really was not written';
+
+	# A server that never ran has no transport either — the other way to have no
+	# channel at all.
+	my $fresh = MCP::Server.new(:name<fresh>, :version<1.0.0>);
+	nok $fresh.notify(a-note('nowhere at all')), 'A server with no transport reports the same';
+};
+
+subtest 'A legacy request\'s own sink wins over the transport' => {
+	plan 3;
+
+	my ($server, $transport) = session(%init-request, %initialized);
+	my Int $before = $transport.written.elems;
+
+	my @sunk;
+	my $ctx = MCP::Server::Context.new(era => 'legacy', emit => -> %notif { @sunk.push(%notif) });
+	ok (do { my $*MCP-REQUEST-CONTEXT = $ctx; $server.notify(a-note('in flight')) }),
+		'Delivered';
+	is @sunk.map({ $_<params><data> }).List, ('in flight',), 'To the request\'s channel';
+	is $transport.written.elems, $before, 'Not twice, and not on the shared one';
+};
+
+subtest 'notify says nothing on $*ERR; log still does' => {
+	plan 4;
+
+	my ($server, $transport) = session(%init-request, %initialized);
+
+	my $quiet = ErrSink.new;
+	{
+		my $*ERR = $quiet;
+		ok $server.notify(a-note('seen only by the client')), 'The notification was delivered';
+	}
+	is $quiet.lines.elems, 0, 'And stderr heard nothing about it';
+
+	my $loud = ErrSink.new;
+	{
+		my $*ERR = $loud;
+		$server.log('warning', 'seen by everybody');
+	}
+	is $loud.lines.elems, 1, 'log still echoes every line it is given';
+	is $loud.lines[0], '[MCP/warning] seen by everybody', 'In the format it always used';
+};
+
+subtest 'log gates by level, notify does not' => {
+	plan 4;
+
+	my ($server, $transport) = session(
+		%init-request,
+		%initialized,
+		{ jsonrpc => '2.0', id => 2, method => 'logging/setLevel', params => { level => 'error' } },
+	);
+	my Int $before = $transport.written.elems;
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.log('debug', 'below the threshold');
+	}
+	is $transport.written.elems, $before, 'log drops a message below the level the client set';
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.log('error', 'at the threshold');
+	}
+	is $transport.written.elems, $before + 1, 'and sends one at or above it';
+
+	# The gate is the caller's business here, which is the whole point: a
+	# progress notification has no level to gate on, and a background job's
+	# output must not be silenced by a setting made for log lines.
+	ok $server.notify(a-note('below, and sent anyway')), 'notify ignores the same setting';
+	is $transport.written.elems, $before + 2, 'and writes it';
+};
+
+subtest 'log delivers through notify, with the params the spec names' => {
+	plan 4;
+
+	# The session logs on its own account (the client's "initialized", the
+	# shutdown line), so only what was written after it counts here.
+	my ($server, $transport) = session(%init-request, %initialized);
+	my Int $before = $transport.written.elems;
+	{
+		my $*ERR = ErrSink.new;
+		$server.log('notice', 'something happened');
+	}
+
+	my @notes = notifications($transport.written[$before .. *].map({ from-json($_) }).list);
+	is @notes.elems, 1, 'One notification for one log line';
+	is-deeply @notes[0]<params>.keys.sort.List, ('data', 'level', 'logger').List,
+		'LoggingMessageNotificationParams: level, logger, data — no invented keys';
+	is @notes[0]<params><data>, 'something happened',
+		'The message travels as the data payload';
+	is @notes[0]<params><level>, 'notice', 'At the level it was logged';
+};
+
+subtest 'A handler can notify on the channel of the request it is serving' => {
+	plan 4;
+
+	# The end-to-end shape the Shell pack uses: a tool handler raising its own
+	# notification through the server rather than reaching for the context.
+	my $server = MCP::Server.new(:name<notify-server>, :version<1.0.0>);
+	$server.tool: 'chatty', :handler(-> :%args {
+		$server.notify(notification('notifications/message', {
+			level => 'info', logger => 'chatty', data => 'working',
+		}));
+		'done';
+	});
+
+	my $transport = ScriptedTransport.new(inbound => (
+		%init-request, %initialized,
+		{ jsonrpc => '2.0', id => 2, method => 'tools/call',
+		  params => { name => 'chatty', arguments => {} } },
+	).map({ to-json($_, :!pretty) }).Array);
+
+	my $err = ErrSink.new;
+	{
+		my $*ERR = $err;
+		$server.run(:$transport);
+	}
+
+	my @messages = $transport.messages;
+	my @notes = notifications(@messages).grep({ $_<params><logger> eq 'chatty' }).list;
+	is @notes.elems, 1, 'The handler\'s notification reached the client';
+
+	my $note-at = @messages.first({ ($_<params><logger> // '') eq 'chatty' }, :k);
+	my $response-at = @messages.first({ ($_<id>:exists) && $_<id> == 2 }, :k);
+	ok $note-at.defined && $response-at.defined && $note-at < $response-at,
+		'Ahead of the response it belongs to';
+	is @messages[$response-at // 0]<result><content>[0]<text>, 'done',
+		'And the response says what the handler returned';
+	nok $err.lines.grep({ .contains('working') }), 'And it never touched stderr';
+};

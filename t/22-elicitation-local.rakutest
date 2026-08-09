@@ -1,0 +1,196 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Server::Context;
+use MCP::Server::Protocol;
+
+# Elicitation when there is no MCP client to ask: a legacy-era client, or the
+# LLM bridge, where the "client" is a model in somebody else's process and the
+# human is sitting in front of the server itself.  That is what :on-elicit is
+# for, and it is also the path a handler takes when a modern client wins the
+# race -- so the precedence between the two is pinned here as well.
+
+plan 6;
+
+#| Stand-in for $*ERR so handler log lines stay out of the TAP stream.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+sub legacy-call($server, $id, Str:D $name, %arguments = {} --> Hash) {
+	$server.handle-request({
+		jsonrpc => '2.0', :$id, method => 'tools/call',
+		params => { :$name, :%arguments },
+	});
+}
+
+sub modern-call($server, $id, Str:D $name, %arguments = {} --> Hash) {
+	$server.handle-modern-request({
+		jsonrpc => '2.0', :$id, method => 'tools/call',
+		params => {
+			:$name, :%arguments,
+			_meta => {
+				(META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION,
+				(META-CLIENT-CAPABILITIES) => { elicitation => { form => {} } },
+			},
+		},
+	});
+}
+
+#| A server whose only tool asks one question, with whatever :on-elicit the
+#| caller wants behind it.
+sub fixture(*%opts --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<local-elicit>, |%opts);
+
+	$server.tool: 'ask', :handler(-> :%args {
+		my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+			'Your name?',
+			properties => { name => { type => 'string' } },
+			required => ['name',],
+		);
+		$answer.accepted ?? "hello {$answer.content<name> // ''}" !! "refused ({$answer.action})";
+	});
+
+	$server.tool: 'era', :handler(-> :%args {
+		"era: {$*MCP-REQUEST-CONTEXT.era}, can-elicit: {$*MCP-REQUEST-CONTEXT.can-elicit}";
+	});
+
+	$server.tool: 'bad-question', :handler(-> :%args {
+		$*MCP-REQUEST-CONTEXT.elicit('?', properties => { n => { type => 'integer' } });
+	});
+
+	$server;
+}
+
+sub bridge-call($server, Str:D $name, $arguments = {} --> Hash) {
+	$server.execute-tool-calls([
+		{ id => 'call-1', function => { :$name, arguments => $arguments } },
+	])[0];
+}
+
+subtest 'A legacy client with :on-elicit behind it can still be asked' => {
+	plan 4;
+
+	my @asked;
+	my $server = fixture(on-elicit => -> %request {
+		@asked.push(%request);
+		{ action => 'accept', content => { name => 'Ada' } };
+	});
+
+	is legacy-call($server, 1, 'ask')<result><content>[0]<text>, 'hello Ada',
+		'The answer reaches the handler';
+	is @asked.elems, 1, 'The callback was consulted once';
+	is @asked[0]<method>, 'elicitation/create',
+		'And handed a whole ElicitRequest, the same shape a client would receive';
+	is-deeply @asked[0]<params><requestedSchema><required>.List, ('name',),
+		'Schema and all';
+};
+
+subtest 'A local callback may refuse, and may answer badly' => {
+	plan 3;
+
+	my %declined = legacy-call(fixture(on-elicit => -> %r { { action => 'decline' } }), 1, 'ask');
+	is %declined<result><content>[0]<text>, 'refused (decline)', 'A decline is an answer';
+
+	my %cancelled = legacy-call(fixture(on-elicit => -> %r { { action => 'cancel' } }), 1, 'ask');
+	is %cancelled<result><content>[0]<text>, 'refused (cancel)', 'So is a cancel';
+
+	# Nonsense is a refusal rather than a crash: a callback that returns the
+	# wrong thing has failed to obtain consent, which is exactly a decline.
+	my %nonsense = legacy-call(fixture(on-elicit => -> %r { 'yes please' }), 1, 'ask');
+	is %nonsense<result><content>[0]<text>, 'refused (decline)',
+		'A return value that is not an ElicitResult is read as a refusal';
+};
+
+subtest 'The LLM bridge gets a request context of its own' => {
+	plan 5;
+
+	# Before this existed, a handler that so much as looked at
+	# $*MCP-REQUEST-CONTEXT died here: there is no request on this path, so the
+	# dynamic variable was never bound and every method call hit an Any.
+	my $plain = fixture();
+	my %era = bridge-call($plain, 'era');
+	nok %era<is_error>, 'A context-reading tool survives the bridge';
+	is %era<content>, 'era: legacy, can-elicit: False',
+		'It is a legacy-era context, and it knows it has nobody to ask';
+
+	my $asking = fixture(on-elicit => -> %r { { action => 'accept', content => { name => 'Bo' } } });
+	is bridge-call($asking, 'ask')<content>, 'hello Bo',
+		'And with :on-elicit configured the tool can ask the human running the server';
+
+	my %unasked = bridge-call($plain, 'ask');
+	ok %unasked<is_error>, 'Without one, asking is an error result rather than a hang';
+	ok %unasked<content>.contains('pass :on-elicit'),
+		'Naming the thing the server author has to do about it';
+};
+
+subtest 'A client that can be asked beats a callback that could have been' => {
+	plan 4;
+
+	my $calls = 0;
+	my $server = fixture(on-elicit => -> %r { ++$calls; { action => 'accept', content => { name => 'local' } } });
+
+	my %result = modern-call($server, 1, 'ask')<result>;
+	is %result<resultType>, 'input_required',
+		'A modern client that declared the capability is asked over the wire';
+	is $calls, 0, 'The local callback is left alone: the user at the other end is the better answer';
+	is $server.pending-elicitations, 1, 'The call is parked waiting for that client';
+
+	# ...and the fallback is still there for the same server's legacy clients.
+	is legacy-call($server, 2, 'ask')<result><content>[0]<text>, 'hello local',
+		'While a legacy client on the same server still gets the callback';
+};
+
+subtest 'A malformed question fails in the handler that wrote it' => {
+	plan 7;
+
+	my $server = fixture(on-elicit => -> %r { { action => 'accept' } });
+	my %result = legacy-call($server, 1, 'bad-question')<result>;
+	ok %result<isError>, 'An unsupported property type is an error result';
+	ok %result<content>[0]<text>.contains("property 'n' has type 'integer'"),
+		'Naming the property and what is wrong with it';
+
+	# The rest of the validation, exercised directly: these are handler-author
+	# mistakes, and every one of them dies rather than being sent to a client
+	# that would not know what to do with it.
+	my $ctx = MCP::Server::Context.new(era => 'legacy', local-elicit => -> %r { { action => 'accept' } });
+
+	dies-ok { $ctx.elicit('?') }, 'A question with no fields at all dies';
+	dies-ok { $ctx.elicit('?', properties => { a => { type => 'string', enum => [] } }) },
+		'An empty enum dies';
+	dies-ok { $ctx.elicit('?', properties => { a => { type => 'number', enum => <x y>.List } }) },
+		'An enum on a non-string property dies';
+	dies-ok { $ctx.elicit('?', properties => { a => { type => 'string' } }, required => ['b',]) },
+		'Requiring a property that was never declared dies';
+
+	# A whole schema, on the other hand, travels verbatim: the handler owns it.
+	my %sent;
+	my $verbatim = MCP::Server::Context.new(
+		era => 'legacy',
+		local-elicit => -> %r { %sent = %r; { action => 'accept' } },
+	);
+	$verbatim.elicit('?', schema => { type => 'object', properties => { anything => { type => 'array' } } });
+	is-deeply %sent<params><requestedSchema>,
+		{ type => 'object', properties => { anything => { type => 'array' } } },
+		'An explicit :%schema is passed through untouched';
+};
+
+subtest 'Constructor validation for the elicitation knobs' => {
+	plan 5;
+
+	dies-ok { MCP::Server.new(:name<x>, :elicitation-ttl(0)) }, 'A zero TTL dies';
+	dies-ok { MCP::Server.new(:name<x>, :elicitation-ttl(-1)) }, 'A negative TTL dies';
+	dies-ok { MCP::Server.new(:name<x>, :max-pending-elicitations(0)) },
+		'A table with no room in it dies';
+
+	my $tuned = MCP::Server.new(
+		:name<x>, :elicitation-ttl(30), :max-pending-elicitations(2),
+	);
+	is $tuned.elicitation-ttl, 30, 'The TTL is readable';
+	is $tuned.max-pending-elicitations, 2, 'And so is the cap';
+};
+
+done-testing;

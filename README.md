@@ -257,7 +257,9 @@ until $resp.is-done { sleep 0.01 }
 say $resp.msg if $resp.is-success;
 ```
 
-`tools-for-llm` converts registered tools to the OpenAI function-calling format. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back. Tool results include `role`, `tool_call_id`, `content`, and `is_error`.
+`tools-for-llm` converts registered tools to the OpenAI function-calling format, sorted by name so the declarations a prompt carries are stable between runs. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back. Tool results include `role`, `tool_call_id`, `content`, and `is_error`.
+
+Each call's `arguments` may be a hash or the JSON string most APIs actually send; an empty or blank string means "no arguments", which is what models send for a tool that takes none. Anything else that is not a JSON object comes back as a result with `is_error` set, never as an exception.
 
 Resources
 ---------
@@ -533,7 +535,7 @@ $server.handle-request({ jsonrpc => '2.0', id => 4, method => 'tools/list' });
 
   * Every request must carry `params._meta.io.modelcontextprotocol/protocolVersion`; `...clientInfo` and `...clientCapabilities` are optional, and `...logLevel` opts that one request into log notifications. The one exception is `server/discover`, which is how a client finds out what to put there in the first place.
 
-  * Every result carries `resultType`, and this server's is always `complete` — see "Not supported" below.
+  * Every result carries `resultType`. It is `complete` unless the handler stopped to ask the client something, in which case the round is answered `input_required` — see "Elicitation" below.
 
   * Every result carries `_meta.io.modelcontextprotocol/serverInfo`.
 
@@ -656,9 +658,7 @@ MCP::Server.new(:name<x>, :protocol-versions['2024-01-01',]);
 
 ### Not supported
 
-Three parts of 2026-07-28 are deliberately absent. Each is a consequence of what this framework is, not a gap to be filled in later:
-
-  * **Multi-round-trip requests** (MRTR, `input_required`). A server uses these to turn around and ask the client something mid-request — sampling, roots, elicitation. `MCP::Server` never initiates a request, so it has nothing to ask, which is exactly why every result it produces is `resultType: "complete"`.
+Two parts of 2026-07-28 are deliberately absent. Each is a consequence of what this framework is, not a gap to be filled in later:
 
   * **`subscriptions/listen`**. Subscriptions only mean something if the server emits change notifications, and this one emits none and advertises no `listChanged` capability. Rather than accept a subscription it would never honour, it answers `-32601` (`404` over HTTP) like any other method it does not have.
 
@@ -732,6 +732,10 @@ my %response = $server.handle-modern-request(
 
   * `cancelled` — has the caller given up? The server never interrupts a running handler, so a long loop that wants to be interruptible has to look.
 
+  * `elicit($message, ...)` — ask the human on the other end of the client a question and block until they answer. See "Elicitation" below.
+
+  * `can-elicit` — is there anybody to ask? Worth checking in a handler that can work either way, rather than catching `elicit`'s exception.
+
 `era`, `protocol-version`, `log-level`, `client-info` and `client-capabilities` are readable too, for a handler that wants to adapt to what the client said about itself.
 
 ```raku
@@ -751,6 +755,161 @@ $server.tool: 'crunch',
 ```
 
 Outside a request — during startup, say — `$*MCP-REQUEST-CONTEXT` is undefined, and `$server.log` falls back to the legacy transport-wide channel. Logging always writes to `$*ERR` whatever else happens to it, so nothing is ever lost just because no client was listening.
+
+### Notifications that are not log lines
+
+`$server.notify(%notification)` is the delivery half of `log` on its own: it takes a whole notification — `{ method => ..., params => ... } `, as `MCP::Server::Protocol`'s `notification` sub builds it — routes it exactly as `log` would, and returns `True` if some channel took it.
+
+```raku
+use MCP::Server::Protocol;
+
+$server.notify(notification('notifications/progress', {
+    progressToken => $token, progress => $done, total => @work.elems,
+}));
+```
+
+The two things it does not do are the point of it. It never echoes to `$*ERR`, so a background job streaming its output to a client does not also spray the host process's terminal; and it applies no level gating, because `notifications/progress` has no level to gate on and a job's output should not be silenced by a `logging/setLevel` made for log lines. **Gating is therefore the caller's job**: a `notifications/message` raised this way should be sent only when `$*MCP-REQUEST-CONTEXT.wants-log($level)` agrees, since the 2026-07-28 rule that a server **must not** log for a request that did not opt in is not enforced here.
+
+It is safe to call from any thread — the bundled transports serialise their writes — which is what makes it usable from a `Supply.interval` flusher or a worker that outlives the request that started it. A modern request's notification still goes to that request's channel and nowhere else; out of a request the legacy rules apply, so nothing is sent before the client has said it is initialized.
+
+The bridge is the one exception to "outside a request": a tool called through `execute-tool-calls` gets a legacy-era context with no notification sink, so a handler that reads the context works there too rather than dying on an undefined dynamic variable.
+
+Elicitation
+-----------
+
+A handler can stop in the middle of its work and ask the human on the other end of the client a question:
+
+```raku
+$server.tool: 'deploy',
+    description => 'Deploy the current build',
+    handler => -> :%args {
+        my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+            'Which environment should I deploy to?',
+            properties => {
+                env => {
+                    type        => 'string',
+                    description => 'Target environment',
+                    enum        => <staging production>.List,
+                },
+                notes => { type => 'string', description => 'Release notes' },
+            },
+            required => ['env',],
+        );
+
+        # A refusal is an answer, not a malfunction.
+        return 'Nothing deployed.' unless $answer.accepted;
+
+        deploy($answer.content<env>, notes => $answer.content<notes> // '');
+        "Deployed to {$answer.content<env>}.";
+    };
+```
+
+`elicit` returns an `MCP::Server::Elicitation::Outcome`: `action` (`accept`, `decline` or `cancel`), the predicates `accepted`, `declined` and `cancelled`, and `content` — the form the user filled in, populated only for an accept. Nothing here throws when the user says no, because a user saying no is the system working.
+
+Ask more than once and each question is a separate round trip; ask from several threads at once and they go out together in one.
+
+### What goes on the wire
+
+Elicitation is the 2026-07-28 **multi round-trip request** pattern (MRTR). The call the handler is serving is answered with a question rather than a result:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "q1": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "form",
+          "message": "Which environment should I deploy to?",
+          "requestedSchema": {
+            "type": "object",
+            "properties": {
+              "env": { "type": "string", "enum": ["staging", "production"] },
+              "notes": { "type": "string", "description": "Release notes" }
+            },
+            "required": ["env"]
+          }
+        }
+      }
+    },
+    "requestState": "mrtr-3-1f0c…",
+    "_meta": { "io.modelcontextprotocol/serverInfo": { } }
+  }
+}
+```
+
+The client asks its user and sends the **same request again** — a new JSON-RPC id, the original `params`, plus the answers keyed by the server's own ids and the `requestState` echoed back byte for byte:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "deploy",
+    "arguments": { },
+    "inputResponses": {
+      "q1": { "action": "accept", "content": { "env": "staging" } }
+    },
+    "requestState": "mrtr-3-1f0c…",
+    "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+  }
+}
+```
+
+Only `tools/call`, `resources/read` and `prompts/get` may be answered this way — the spec names those three and no others — and only for a client that declared `elicitation: { form: {} }` in its `_meta` `clientCapabilities`. A handler that asks anyway gets an exception saying which of the two conditions failed, which for a tool becomes an `isError` result. Check `can-elicit` first if the handler can do something useful without an answer.
+
+Each round is an independent request with its own notification channel, its own `logLevel` opt-in and its own cancellation signal, and the context delegates accordingly: a log line raised after the handler resumes goes out on the round that resumed it. The original request's disconnection is **not** treated as cancellation — it was answered the moment the call parked, so its stream closing is expected.
+
+### How the handler survives the gap
+
+The handler is **parked**, not restarted. It runs on a thread of its own and blocks in `await`, which inside a `start` block suspends the continuation without pinning a pool thread. Everything it had already done stays done — which a restart-based implementation could not promise, since it would re-run every side effect up to the question.
+
+Two consequences worth knowing about:
+
+  * A parked call does not survive a restart of the process. The token names an in-memory rendezvous, not a serialised continuation.
+
+  * Behind a load balancer, the retry must reach the instance that asked. Route on `requestState` or pin the session.
+
+Only a modern-era request, on one of the three eligible methods, from a client that declared the capability is dispatched onto its own thread. Everything else — stdio, legacy clients, clients that declared nothing — runs synchronously on the caller's thread exactly as it always has.
+
+### Timeouts, TTL and capacity
+
+  * `$ctx.elicit(..., :timeout(30)) ` bounds one question: when it runs out the question is withdrawn and the answer is a `cancel`.
+
+  * `MCP::Server.new(:elicitation-ttl(300)) ` bounds the wait for a client that never comes back. When it expires the call is abandoned: `elicit` throws inside the handler, which unwinds through its own error path, and the token stops working.
+
+  * `MCP::Server.new(:max-pending-elicitations(64)) ` bounds how many calls may sit parked at once. Past that, asking is refused with an error result rather than queued behind clients that may never answer.
+
+  * `.pending-elicitations` reports how many are parked right now, for a health endpoint or a test.
+
+### When there is no client to ask
+
+`:&on-elicit` is the fallback for the paths where the "client" cannot be asked anything: a legacy-era client, the LLM tool bridge, or a handler called directly from your own code. It takes the same ElicitRequest the client would have received and returns an ElicitResult:
+
+```raku
+my $server = MCP::Server.new(
+    :name<deployer>,
+    on-elicit => -> %request {
+        say %request<params><message>;
+        my $answer = prompt('> ');
+        $answer.defined && $answer.trim.chars
+            ?? { action => 'accept', content => { env => $answer.trim } }
+            !! { action => 'decline' };
+    },
+);
+```
+
+Anything it returns that is not an ElicitResult is read as a decline. A modern client that declared the capability always wins over it: the human at the other end of the protocol is a better answer than a callback in the server process.
+
+One caveat on that example: `prompt` reads stdin and writes stdout, so it only works in a server that does not own them. Over stdio those two are the protocol, and writing a question to stdout corrupts it — a stdio server's fallback has to ask somewhere else (a GUI, a queue, a policy table), or the server has to run over HTTP, as `MCP::Server::Tool::Ask`'s example does.
+
+### A note on the token
+
+`requestState` is a monotonic counter plus 128 bits from `rand`. Raku's core has no CSPRNG, and `rand` is a Mersenne Twister, so a token is not unguessable to an attacker who has seen a few of them. What guessing one buys is the ability to answer somebody else's question once, within the TTL, on the right method — no data comes back out — and it is defended in depth: claims are single use, pinned to the method that minted the token, bounded by the TTL and capped in number. Binding to a real CSPRNG is a tracked follow-up rather than something this release pretends to have.
 
 HTTP transport
 --------------
@@ -809,6 +968,8 @@ The three routing headers are what let a proxy route and rate-limit MCP traffic 
 
   * `:$keepalive` — default `15` seconds between SSE keepalive comments, which stop proxies and impatient clients from tearing down a stream whose handler is still thinking. Must be greater than zero.
 
+  * `:$disconnect-poll` — default `0.25` seconds between the client-liveness probes that turn a hangup into `$*MCP-REQUEST-CONTEXT.cancelled`. See "Cancellation and thread safety" below. Must be greater than zero.
+
 ### From the command line
 
     $ raku-mcp --tool=FileSystem={"root":"/docs"} --http=8080
@@ -859,11 +1020,11 @@ Calling a `slow-count` tool that logs `"step $_"` as it goes, with both conditio
              "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                       "io.modelcontextprotocol/logLevel":"info"}}}'
 
-    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","message":"step 0"}}
+    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","data":"step 0"}}
 
-    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","message":"step 1"}}
+    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","data":"step 1"}}
 
-    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","message":"step 2"}}
+    data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"my-tools","data":"step 2"}}
 
     data: {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"counted to 3"}],"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"my-tools","version":"1.0"}}}}
 
@@ -895,7 +1056,9 @@ Stray `Mcp-Session-Id` and `Last-Event-ID` headers — artifacts of an older Str
 
 ### Cancellation and thread safety
 
-A client closing the response stream is the only cancellation signal this protocol has. When it happens, `$*MCP-REQUEST-CONTEXT.cancelled` flips to `True` and the eventual result is discarded. **The server never interrupts a running handler**: a synchronous one that never looks runs to completion, holding its thread. Anything long-running should poll.
+A client hanging up is the only cancellation signal this protocol has — whether it closed the response stream, cancelled the request, or the connection died under it. When it happens, `$*MCP-REQUEST-CONTEXT.cancelled` flips to `True` and the eventual result is discarded. **The server never interrupts a running handler**: a synchronous one that never looks runs to completion, holding its thread. Anything long-running should poll.
+
+Nothing pushes a disconnect at the endpoint — a Cro route is handed a request, not a connection lifetime — so it is checked for, on the `disconnect-poll` interval (a quarter of a second by default), with a zero-byte write that puts nothing on the wire. Lower it for handlers that should give up the moment their caller does; raise it to trade latency for syscalls. Detection is exact rather than heuristic: a socket that has read EOF from its peer is closed, so a client that has hung up could not have been sent the answer anyway. Behind TLS the probe cannot tell, and cancellation then falls back to the slower signal — the write that fails when the handler finally answers — so a handler on a TLS endpoint may never see the flag at all.
 
 ```raku
 $server.tool: 'reindex',
