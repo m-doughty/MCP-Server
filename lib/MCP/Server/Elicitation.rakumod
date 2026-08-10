@@ -115,10 +115,11 @@ my sub normalise-result($value --> Hash) {
 #| Each round of the trip is a B<different> JSON-RPC request, with its own
 #| notification sink and its own cancellation signal.  The broker is told which
 #| context is live with L<#method begin-round> / L<#method end-round>, and
-#| C<MCP::Server::Context> delegates C<emit-notification>, C<wants-log> and
-#| C<cancelled> to it, so a log line raised by the handler in round three goes
-#| out on round three's channel.  While the call is parked there is no live
-#| context at all: emissions are dropped and C<cancelled> is False, because the
+#| C<MCP::Server::Context> delegates C<emit-notification>, C<wants-log>,
+#| C<progress-token> and C<cancelled> to it, so a log line raised by the handler
+#| in round three goes out on round three's channel.  While the call is parked
+#| there is no live context at all: emissions are dropped, there is no progress
+#| token to quote and C<cancelled> is False, because the
 #| request that carried the call in has already been answered and its
 #| disconnection is expected rather than a signal to give up.
 class Broker {
@@ -337,6 +338,15 @@ class Broker {
 		my $ctx = $!lock.protect: { $!round-ctx };
 		return False without $ctx;
 		$ctx.emit-notification(%notif);
+	}
+
+	#| The progress token of the round in flight, or an undefined value when
+	#| that round asked for no progress — and while the call is parked, when
+	#| there is no round to attach a notification to at all.
+	method progress-token() {
+		my $ctx = $!lock.protect: { $!round-ctx };
+		return Nil without $ctx;
+		$ctx.progress-token;
 	}
 
 	#| Whether the round in flight opted in to logging at C<$level>.

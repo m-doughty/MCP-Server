@@ -1,0 +1,356 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Context;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+
+# Progress is the one notification a client has to ask for: a request carries a
+# progressToken in its params._meta when the caller wants to be kept posted, and
+# a server that sends notifications/progress without one is inventing a
+# correlation id nobody can use.  $*MCP-REQUEST-CONTEXT.progress is that rule
+# made automatic, so everything here is about the two halves of it -- what goes
+# on the wire when a token was supplied, and the silence when it was not.
+#
+# The channel rules are notify's and are pinned in t/24; what is added here is
+# that progress follows them, including mid-elicitation, where the token belongs
+# to the round in flight rather than to the request that started the trip.
+
+plan 8;
+
+constant TIMEOUT = 20;
+
+#| Transport that plays a canned script of inbound lines and records everything
+#| the server writes, in order.  Same double as t/24's.
+class ScriptedTransport does MCP::Server::Transport {
+	has @.inbound;
+	has @.written;
+
+	method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+	method write-message(Str:D $msg) { @!written.push($msg) }
+	method messages(--> List) { @!written.map({ from-json($_) }).list }
+}
+
+#| Stand-in for $*ERR so the server's own log lines stay out of the TAP stream.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+#| A modern request, with a progress token when one is asked for.  `:token` is
+#| deliberately untyped: half the point of these tests is what the server does
+#| with a token that is not a string.
+sub modern($id, Str:D $method, %params, :$token, Bool:D :$caps = False --> Hash) {
+	my %meta = (META-PROTOCOL-VERSION) => MODERN-PROTOCOL-VERSION;
+	%meta{META-CLIENT-CAPABILITIES} = { elicitation => { form => {} } } if $caps;
+	%meta{META-PROGRESS-TOKEN} = $token if $token.defined;
+
+	my %full = %params;
+	%full<_meta> = %meta;
+	{ jsonrpc => '2.0', :$id, :$method, params => %full };
+}
+
+#| A legacy request: no protocol version marker, but the same _meta key, because
+#| progressToken predates the 2026-07-28 namespacing and both eras spell it the
+#| same way.
+sub legacy($id, Str:D $method, %params, :$token --> Hash) {
+	my %full = %params;
+	%full<_meta> = { (META-PROGRESS-TOKEN) => $token } if $token.defined;
+	{ jsonrpc => '2.0', :$id, :$method, params => %full };
+}
+
+sub progress-notes(@notes --> List) {
+	@notes.grep({ ($_<method> // '') eq 'notifications/progress' }).list;
+}
+
+# === The server under test ===
+
+sub fixture(--> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<progress-test>, :version<1.0.0>);
+
+	# Reports how many of its progress calls were actually delivered, so "the
+	# handler is told" is provable from the result rather than only from the
+	# absence of notifications.
+	$server.tool: 'countdown',
+		description => 'Work through some steps, saying so as it goes',
+		params => { steps => { type => 'integer' } },
+		handler => -> :%args {
+			my $steps = %args<steps> ~~ Real:D ?? %args<steps>.Int !! 3;
+			my $sent = 0;
+			for 1 .. $steps -> $i {
+				$sent++ if $*MCP-REQUEST-CONTEXT.progress(
+					$i, total => $steps, message => "step $i",
+				);
+			}
+			"sent $sent of $steps";
+		};
+
+	# One call with nothing optional on it: the shape of a minimal
+	# ProgressNotificationParams.
+	$server.tool: 'bare',
+		description => 'Report progress with neither a total nor a message',
+		handler => -> :%args {
+			$*MCP-REQUEST-CONTEXT.progress(1);
+			'bare';
+		};
+
+	# Each optional on its own, so "omitted when absent" is not proved by the
+	# both-or-neither case alone.
+	$server.tool: 'totalled',
+		handler => -> :%args { $*MCP-REQUEST-CONTEXT.progress(2, total => 7); 'totalled' };
+	$server.tool: 'chatty',
+		handler => -> :%args { $*MCP-REQUEST-CONTEXT.progress(0.5, message => 'halfway'); 'chatty' };
+
+	# What the handler can see before it decides to do the work of reporting.
+	$server.tool: 'peek',
+		description => 'Say what token, if any, this request carried',
+		handler => -> :%args {
+			my $token = $*MCP-REQUEST-CONTEXT.progress-token;
+			$token.defined ?? "token={$token} ({$token.^name})" !! 'no token';
+		};
+
+	# Progress either side of a question: the round-scoped case.
+	$server.tool: 'ask-and-report',
+		description => 'Report, ask, report again',
+		handler => -> :%args {
+			$*MCP-REQUEST-CONTEXT.progress(1, message => 'before');
+			my $answer = $*MCP-REQUEST-CONTEXT.elicit(
+				'Carry on?', properties => { reply => { type => 'string' } },
+			);
+			$*MCP-REQUEST-CONTEXT.progress(2, message => 'after');
+			"carried on ({$answer.action})";
+		};
+
+	$server;
+}
+
+subtest 'A request that asked for progress gets it, on its own channel' => {
+	plan 7;
+
+	my $server = fixture();
+	my @notes;
+	my %response = $server.handle-modern-request(
+		modern(1, 'tools/call', { name => 'countdown', arguments => { steps => 3 } },
+			token => 'tok-1'),
+		notify => -> %note { @notes.push(%note) },
+	);
+
+	my @progress = progress-notes(@notes);
+	is @progress.elems, 3, 'One notification per step';
+	is-deeply @progress.map({ $_<params><progress> }).List, (1, 2, 3),
+		'Counting up, as the spec asks for';
+	is-deeply @progress.map({ $_<params><progressToken> }).unique.List, ('tok-1',),
+		'Every one quoting the client\'s own token back';
+	is-deeply @progress.map({ $_<params><total> }).unique.List, (3,), 'With the total it knows';
+	is @progress[1]<params><message>, 'step 2', 'And the message the handler wrote';
+
+	is @progress[0]<jsonrpc>, '2.0', 'It is a JSON-RPC notification, framed like any other';
+	is %response<result><content>[0]<text>, 'sent 3 of 3',
+		'And the handler was told each one went out';
+};
+
+subtest 'No token means no progress, and the handler can tell' => {
+	plan 4;
+
+	my $server = fixture();
+	my @notes;
+	my %response = $server.handle-modern-request(
+		modern(1, 'tools/call', { name => 'countdown', arguments => { steps => 3 } }),
+		notify => -> %note { @notes.push(%note) },
+	);
+
+	is progress-notes(@notes).elems, 0,
+		'A server MUST NOT report progress nobody asked for, and does not';
+	is %response<result><content>[0]<text>, 'sent 0 of 3',
+		'The Bool says so, so a handler can stop computing progress lines';
+	is %response<result><resultType>, 'complete', 'The call itself is unaffected';
+
+	my %peeked = $server.handle-modern-request(
+		modern(2, 'tools/call', { name => 'peek', arguments => {} }),
+	);
+	is %peeked<result><content>[0]<text>, 'no token',
+		'And progress-token is undefined rather than empty';
+};
+
+subtest 'The token travels back exactly as it came, or not at all' => {
+	plan 6;
+
+	my $server = fixture();
+
+	sub token-seen($token --> Any) {
+		my @notes;
+		$server.handle-modern-request(
+			modern(1, 'tools/call', { name => 'bare', arguments => {} }, :$token),
+			notify => -> %note { @notes.push(%note) },
+		);
+		my @progress = progress-notes(@notes);
+		@progress ?? @progress[0]<params><progressToken> !! Nil;
+	}
+
+	is token-seen('abc'), 'abc', 'A string token comes back as a string';
+
+	# ProgressToken is string | number, and a client that sent 42 must not be
+	# answered about "42": it correlates on the value it sent.
+	my $numeric = token-seen(42);
+	is $numeric, 42, 'A numeric token comes back as a number';
+	ok $numeric ~~ Real:D && $numeric !~~ Str, 'Really a number, not a stringified one';
+
+	# Anything the protocol does not allow is read as "no token asked for" rather
+	# than as an error: it is a hint on a request that is otherwise well formed.
+	is token-seen({ nested => 'object' }), Nil, 'An object is not a token';
+	is token-seen([1, 2]), Nil, 'Neither is an array';
+	# True is an Int in Raku, so without an explicit guard it would be quoted
+	# back as 1 -- a token the client never minted.
+	is token-seen(True), Nil, 'And neither is a bare true';
+};
+
+subtest 'The optional halves are omitted, never sent empty' => {
+	plan 4;
+
+	my $server = fixture();
+
+	sub params-of(Str:D $tool --> Hash) {
+		my @notes;
+		$server.handle-modern-request(
+			modern(1, 'tools/call', { name => $tool, arguments => {} }, token => 't'),
+			notify => -> %note { @notes.push(%note) },
+		);
+		progress-notes(@notes)[0]<params>;
+	}
+
+	is-deeply params-of('bare').keys.sort.List, ('progress', 'progressToken').List,
+		'A bare report is the two required members and nothing else';
+	is-deeply params-of('totalled').keys.sort.List,
+		('progress', 'progressToken', 'total').List,
+		'A total rides along when there is one';
+	is-deeply params-of('chatty').keys.sort.List,
+		('message', 'progress', 'progressToken').List,
+		'And so does a message';
+	is params-of('chatty')<progress>, 0.5,
+		'Progress is a number, and a fractional one is left alone';
+};
+
+subtest 'No channel is an answer, not a crash' => {
+	plan 3;
+
+	my $server = fixture();
+
+	# handle-request with no :&notify is the bare dispatch path: the request has
+	# a token but nowhere to send anything, which is exactly what notify reports
+	# False for.
+	my %response;
+	lives-ok {
+		%response = $server.handle-request(
+			modern(1, 'tools/call', { name => 'countdown', arguments => { steps => 2 } },
+				token => 'tok'),
+		);
+	}, 'A handler reporting progress into the void survives it';
+	is %response<result><content>[0]<text>, 'sent 0 of 2',
+		'And is told nothing was delivered';
+
+	# The context on its own, with a token and no sink: the same answer, one
+	# layer down.
+	my $ctx = MCP::Server::Context.new(
+		era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION, progress-token => 'x',
+	);
+	nok $ctx.progress(1), 'A context with a token but no sink reports it undelivered';
+};
+
+subtest 'A legacy client asks the same way and is answered the same way' => {
+	plan 4;
+
+	my $server = fixture();
+	my $transport = ScriptedTransport.new(inbound => (
+		{ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} },
+		{ jsonrpc => '2.0', method => 'notifications/initialized' },
+		legacy(2, 'tools/call', { name => 'countdown', arguments => { steps => 2 } },
+			token => 'legacy-tok'),
+	).map({ to-json($_, :!pretty) }).Array);
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+
+	my @messages = $transport.messages;
+	my @progress = progress-notes(@messages);
+	is @progress.elems, 2, 'The legacy request\'s progress reached the client';
+	is-deeply @progress.map({ $_<params><progressToken> }).unique.List, ('legacy-tok',),
+		'Under the token it sent, spelled the way both eras spell it';
+
+	my $last-note = @messages.first({ ($_<method> // '') eq 'notifications/progress' }, :end, :k);
+	my $response-at = @messages.first({ ($_<id>:exists) && $_<id> == 2 }, :k);
+	ok $last-note.defined && $response-at.defined && $last-note < $response-at,
+		'Ahead of the response it belongs to, which is the only order that is any use';
+	is @messages[$response-at // 0]<result><content>[0]<text>, 'sent 2 of 2',
+		'And the call answered normally afterwards';
+};
+
+subtest 'A modern request\'s progress never leaks onto the shared transport' => {
+	plan 2;
+
+	# A server with a transport bound and a live legacy session on it -- the
+	# channel a modern notification must never fall back to, because another
+	# client's request is reading it.
+	my $server = fixture();
+	my $transport = ScriptedTransport.new(inbound => (
+		{ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} },
+		{ jsonrpc => '2.0', method => 'notifications/initialized' },
+	).map({ to-json($_, :!pretty) }).Array);
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+	my Int $before = $transport.written.elems;
+
+	# Modern, with a token, and no sink of its own.
+	my %response = $server.handle-modern-request(
+		modern(9, 'tools/call', { name => 'countdown', arguments => { steps => 2 } },
+			token => 'tok'),
+	);
+
+	is $transport.written.elems, $before, 'Nothing was written to the shared channel';
+	is %response<result><content>[0]<text>, 'sent 0 of 2',
+		'The progress was dropped rather than misrouted';
+};
+
+subtest 'Mid-elicitation, progress belongs to the round in flight' => {
+	plan 5;
+
+	my $server = fixture();
+	my %params = name => 'ask-and-report', arguments => {};
+
+	my @first;
+	my %opening = $server.handle-modern-request(
+		modern(1, 'tools/call', %params, token => 'round-one', :caps),
+		notify => -> %note { @first.push(%note) },
+	)<result>;
+
+	is %opening<resultType>, 'input_required', 'The handler stopped to ask something';
+	is-deeply progress-notes(@first).map({ $_<params><message> }).List, ('before',),
+		'The report it made first went out on the round that carried the call in';
+
+	# The retry is a different request with a different id -- and, here, a
+	# different token, which is the one the second report has to quote.
+	my %retry = %params.Hash;
+	%retry<requestState> = %opening<requestState>;
+	%retry<inputResponses> = {
+		%opening<inputRequests>.keys.head => { action => 'accept', content => { reply => 'yes' } },
+	};
+
+	my @second;
+	my %final = $server.handle-modern-request(
+		modern(2, 'tools/call', %retry, token => 'round-two', :caps),
+		notify => -> %note { @second.push(%note) },
+	)<result>;
+
+	my @after = progress-notes(@second);
+	is-deeply @after.map({ $_<params><message> }).List, ('after',),
+		'The report it made afterwards went out on the round that resumed it';
+	is @after[0]<params><progressToken>, 'round-two',
+		'Quoting that round\'s token, not the one the trip started with';
+	is %final<content>[0]<text>, 'carried on (accept)', 'And the call finished normally';
+};

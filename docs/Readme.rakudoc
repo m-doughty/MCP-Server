@@ -946,15 +946,19 @@ through C<_meta> C<logLevel>.
 =item C<cancelled> — has the caller given up? The server never
 interrupts a running handler, so a long loop that wants to be
 interruptible has to look.
+=item C<progress($done, :$total, :$message)> — tell the client how far
+along this request is. Returns C<False> and sends nothing when the
+client attached no progress token, so it is safe to call unconditionally.
+See "Progress" below.
 =item C<elicit($message, ...)> — ask the human on the other end of the
 client a question and block until they answer. See "Elicitation" below.
 =item C<can-elicit> — is there anybody to ask? Worth checking in a
 handler that can work either way, rather than catching C<elicit>'s
 exception.
 
-C<era>, C<protocol-version>, C<log-level>, C<client-info> and
-C<client-capabilities> are readable too, for a handler that wants to
-adapt to what the client said about itself.
+C<era>, C<protocol-version>, C<log-level>, C<progress-token>,
+C<client-info> and C<client-capabilities> are readable too, for a handler
+that wants to adapt to what the client said about itself.
 
 =begin code :lang<raku>
 $server.tool: 'crunch',
@@ -1014,6 +1018,46 @@ The bridge is the one exception to "outside a request": a tool called
 through C<execute-tool-calls> gets a legacy-era context with no
 notification sink, so a handler that reads the context works there too
 rather than dying on an undefined dynamic variable.
+
+=head3 Progress
+
+Progress is opt-in from the client's side: a request carries a
+C<progressToken> in its C<params._meta> when the caller wants to be kept
+posted, and a server B<must not> send C<notifications/progress> for one
+that did not. C<$*MCP-REQUEST-CONTEXT.progress> is that rule made
+automatic — it quotes back the token of the request (or, mid-elicitation,
+of the round) in flight, and does nothing at all when there is none:
+
+=begin code :lang<raku>
+$server.tool: 'reindex',
+    description => 'Reindex every document',
+    handler => -> :%args {
+        my $ctx = $*MCP-REQUEST-CONTEXT;
+        my @docs = documents();
+        for @docs.kv -> $i, $doc {
+            reindex($doc);
+            $ctx.progress($i + 1, total => @docs.elems, message => $doc.name);
+        }
+        "reindexed {@docs.elems} documents";
+    };
+=end code
+
+The C<Bool> it returns says whether the notification really went out:
+C<False> for a client that asked for no progress, and C<False> as well
+when the request has no notification channel (a bare C<handle-request>,
+or the LLM bridge). A handler that only wants to skip the work of
+computing a progress line can ask C<$ctx.progress-token.defined> first.
+
+C<:$total> and C<:$message> are both optional and are left out of the
+notification when they are not given: C<ProgressNotificationParams> marks
+them optional, and an absent total is not the same claim as a total of
+zero. C<$progress> should increase on every call, whether or not a total
+is known.
+
+Routing is the request's own channel, so progress for one request can
+never surface in another's stream, and nothing is level-gated — progress
+has no level — or echoed to C<$*ERR>. Both eras spell the token the same
+way, so a 2025-11-25 client gets progress from the same handler code.
 
 =head2 Elicitation
 

@@ -3,7 +3,7 @@ use lib 'lib';
 use JSON::Fast;
 use MCP::Server;
 
-plan 10;
+plan 11;
 
 my $server = MCP::Server.new(:name<test>);
 
@@ -187,6 +187,31 @@ subtest 'Empty arguments mean no arguments, not a parse error' => {
 	# object, or the model needs to hear that it did not.
 	ok @results[3]<is_error>, 'A non-empty string that is not an object is still an error';
 	is @results[3]<content>, 'Tool arguments must be a JSON object', '...and says so';
+};
+
+subtest 'The tools run inside execute-tool-calls, not when the caller looks' => {
+	plan 4;
+
+	# A lazy `.map(...).list` would hand back a Seq whose handlers run at the
+	# caller's first reification -- on another thread, after a cancellation, or
+	# never.  Tools have side effects, so "when did it run?" is not a detail: an
+	# agent that abandons a batch must not discover later that it deleted a file.
+	my $ran = MCP::Server.new(:name<eager>);
+	my $calls = 0;
+	my $lock = Lock.new;
+	$ran.tool: 'count', :handler(-> :%args { $lock.protect: { ++$calls }; 'counted' });
+
+	my @results = $ran.execute-tool-calls([
+		{ id => 'a', function => { name => 'count', arguments => {} } },
+		{ id => 'b', function => { name => 'count', arguments => {} } },
+	]);
+
+	# Asserted before anything reads @results, which is the whole point.
+	is $lock.protect({ $calls }), 2, 'Both handlers ran before the method returned';
+
+	is @results.elems, 2, 'And the results were there waiting';
+	is @results[1]<content>, 'counted', 'With the answers the handlers gave';
+	is $lock.protect({ $calls }), 2, 'Reading them does not run anything a second time';
 };
 
 done-testing;

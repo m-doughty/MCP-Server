@@ -732,11 +732,13 @@ my %response = $server.handle-modern-request(
 
   * `cancelled` — has the caller given up? The server never interrupts a running handler, so a long loop that wants to be interruptible has to look.
 
+  * `progress($done, :$total, :$message)` — tell the client how far along this request is. Returns `False` and sends nothing when the client attached no progress token, so it is safe to call unconditionally. See "Progress" below.
+
   * `elicit($message, ...)` — ask the human on the other end of the client a question and block until they answer. See "Elicitation" below.
 
   * `can-elicit` — is there anybody to ask? Worth checking in a handler that can work either way, rather than catching `elicit`'s exception.
 
-`era`, `protocol-version`, `log-level`, `client-info` and `client-capabilities` are readable too, for a handler that wants to adapt to what the client said about itself.
+`era`, `protocol-version`, `log-level`, `progress-token`, `client-info` and `client-capabilities` are readable too, for a handler that wants to adapt to what the client said about itself.
 
 ```raku
 $server.tool: 'crunch',
@@ -773,6 +775,30 @@ The two things it does not do are the point of it. It never echoes to `$*ERR`, s
 It is safe to call from any thread — the bundled transports serialise their writes — which is what makes it usable from a `Supply.interval` flusher or a worker that outlives the request that started it. A modern request's notification still goes to that request's channel and nowhere else; out of a request the legacy rules apply, so nothing is sent before the client has said it is initialized.
 
 The bridge is the one exception to "outside a request": a tool called through `execute-tool-calls` gets a legacy-era context with no notification sink, so a handler that reads the context works there too rather than dying on an undefined dynamic variable.
+
+### Progress
+
+Progress is opt-in from the client's side: a request carries a `progressToken` in its `params._meta` when the caller wants to be kept posted, and a server **must not** send `notifications/progress` for one that did not. `$*MCP-REQUEST-CONTEXT.progress` is that rule made automatic — it quotes back the token of the request (or, mid-elicitation, of the round) in flight, and does nothing at all when there is none:
+
+```raku
+$server.tool: 'reindex',
+    description => 'Reindex every document',
+    handler => -> :%args {
+        my $ctx = $*MCP-REQUEST-CONTEXT;
+        my @docs = documents();
+        for @docs.kv -> $i, $doc {
+            reindex($doc);
+            $ctx.progress($i + 1, total => @docs.elems, message => $doc.name);
+        }
+        "reindexed {@docs.elems} documents";
+    };
+```
+
+The `Bool` it returns says whether the notification really went out: `False` for a client that asked for no progress, and `False` as well when the request has no notification channel (a bare `handle-request`, or the LLM bridge). A handler that only wants to skip the work of computing a progress line can ask `$ctx.progress-token.defined` first.
+
+`:$total` and `:$message` are both optional and are left out of the notification when they are not given: `ProgressNotificationParams` marks them optional, and an absent total is not the same claim as a total of zero. `$progress` should increase on every call, whether or not a total is known.
+
+Routing is the request's own channel, so progress for one request can never surface in another's stream, and nothing is level-gated — progress has no level — or echoed to `$*ERR`. Both eras spell the token the same way, so a 2025-11-25 client gets progress from the same handler code.
 
 Elicitation
 -----------

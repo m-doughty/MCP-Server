@@ -398,7 +398,12 @@ method tools-for-llm(--> List) {
 }
 
 method execute-tool-calls(@tool-calls --> List) {
-	@tool-calls.map(-> %tc {
+	# Assigned to an array rather than returned as a `.map(...).list`: a Seq's
+	# .list is still lazy, so the handlers would run at whatever point the caller
+	# first looked at the result -- on another thread, after a cancellation, or
+	# never.  Tools have side effects; they run here, inside the method that was
+	# asked to run them.  MCP::Client's bridge is eager for the same reason.
+	my @results = @tool-calls.map(-> %tc {
 		my $fn-name = %tc<function><name>;
 		my $args = %tc<function><arguments> // {};
 		my $call-id = %tc<id> // '';
@@ -464,7 +469,9 @@ method execute-tool-calls(@tool-calls --> List) {
 			content => ~($result // ''),
 			is_error => $is-error,
 		};
-	}).list;
+	});
+
+	@results.List;
 }
 
 # === Run loop ===
@@ -585,10 +592,21 @@ method !context-for(
 	my $log-level = %meta{META-LOG-LEVEL};
 	$log-level = Str unless ($log-level ~~ Str:D) && (%LOG-LEVELS{$log-level}:exists);
 
+	# Same reading for the progress token, which the protocol defines as a string
+	# or a number and otherwise leaves opaque.  Bool is excluded on purpose: JSON
+	# true would otherwise pass the Real test and be quoted back as 1, which is a
+	# token nobody minted.  Both eras spell the key the same way, so this works
+	# for a 2025-11-25 client too.
+	my $progress-token = %meta{META-PROGRESS-TOKEN};
+	$progress-token = Any
+		unless ($progress-token ~~ Str:D || $progress-token ~~ Real:D)
+			&& $progress-token !~~ Bool;
+
 	MCP::Server::Context.new(
 		:$era,
 		:$protocol-version,
 		:$log-level,
+		:$progress-token,
 		client-info => (%meta{META-CLIENT-INFO} ~~ Associative ?? %meta{META-CLIENT-INFO}.Hash !! {}),
 		client-capabilities => (%meta{META-CLIENT-CAPABILITIES} ~~ Associative
 			?? %meta{META-CLIENT-CAPABILITIES}.Hash !! {}),
@@ -892,6 +910,11 @@ method log(Str:D $level, Str:D $message --> Nil) {
 #|   $server.notify(notification('notifications/progress', {
 #|       progressToken => $token, progress => 3, total => 10,
 #|   }));
+#|
+#| For progress specifically, C<$*MCP-REQUEST-CONTEXT.progress(3, total => 10)>
+#| is the shorter road: it quotes back the token the client attached to the
+#| request in flight (and stays quiet when there was none) instead of leaving the
+#| handler to dig it out of C<_meta> itself.
 #|
 #| Routing is the same as C<log>'s, and so is era-aware: inside a modern-era
 #| request it goes to that request's channel and nowhere else (undelivered, and

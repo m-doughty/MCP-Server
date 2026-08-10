@@ -3,8 +3,9 @@ use MCP::Server::Elicitation;
 
 #| Immutable per-request context: which protocol era a message belongs to, what
 #| the client told us about itself, where notifications raised while the request
-#| is in flight should go, whether the caller has walked away — and how to ask
-#| the human on the other end a question.
+#| is in flight should go, whether the caller wants to be kept posted on
+#| progress, whether the caller has walked away — and how to ask the human on
+#| the other end a question.
 #|
 #| MCP::Server binds the live instance to the $*MCP-REQUEST-CONTEXT dynamic
 #| variable around every dispatch, so handlers (and MCP::Server.log) can reach it
@@ -31,6 +32,14 @@ has Str $.log-level;
 has %.client-info;
 has %.client-capabilities;
 
+# The progress token the client attached to this request (_meta progressToken),
+# undefined when it asked for no progress.  Held privately so `progress-token`
+# can answer for whichever round of a multi round-trip call is in flight rather
+# than for the request that first carried the call in.  Untyped: the protocol
+# says string-or-number and calls it opaque, so it travels back out exactly as
+# it came in.
+has $!progress-token;
+
 #| Notification sink for this request.  Undefined means notifications are
 #| dropped, which is what a bare handle-request with no transport has always
 #| done.
@@ -55,8 +64,9 @@ has &.local-elicit;
 # about (has the caller given up?) instead of handing out the Promise itself.
 has Promise $!cancelled;
 
-submethod TWEAK(Promise :$cancelled) {
+submethod TWEAK(Promise :$cancelled, :$progress-token) {
 	$!cancelled = $cancelled;
+	$!progress-token = $progress-token;
 }
 
 #| Deliver a notification on this request's channel.  Returns True when it was
@@ -87,6 +97,63 @@ method wants-log(Str:D $level --> Bool:D) {
 	log-level-at-least($level, $!log-level);
 }
 
+#| The opaque token the client attached to this request when it asked to be kept
+#| posted (C<_meta> C<progressToken>), or an undefined value when it did not.
+#| A string or a number, whichever the client sent.
+#|
+#| Handlers normally want L<#method progress> rather than this; it is public
+#| because "did anybody ask for progress?" is a question a handler may want to
+#| answer before doing the work of computing it.
+method progress-token() {
+	# Each round of a multi round-trip call carries (or omits) its own token, and
+	# the round in flight is the one whose channel a notification would go out
+	# on -- so it is the one whose token has to be quoted back.
+	with $!broker { return .progress-token }
+
+	$!progress-token;
+}
+
+#| Tell the client how far along this request is, and say whether it was
+#| actually sent.
+#|
+#|   my @files = find-them();
+#|   for @files.kv -> $i, $file {
+#|       process($file);
+#|       $*MCP-REQUEST-CONTEXT.progress($i + 1, total => @files.elems, message => $file);
+#|   }
+#|
+#| False, and nothing sent, when the client attached no C<progressToken> to the
+#| request: progress is opt-in, a server MUST NOT send it unasked, and there
+#| would be nothing to correlate the notification with. False as well when the
+#| request has no notification channel at all (a bare C<handle-request>, or a
+#| call parked mid-elicitation with no round in flight), which is the same
+#| answer C<MCP::Server.notify> gives in that situation.
+#|
+#| Routing is the request's own channel, so a C<notifications/progress> raised
+#| here can never surface in another request's stream. Nothing is gated on a
+#| level — progress has none — and nothing is echoed to C<$*ERR>. Unlike
+#| C<MCP::Server.notify> there is no legacy "has the client said it is
+#| initialized?" gate either, because the question does not arise: a token can
+#| only have come off a request the client sent, and a client sending requests
+#| is a client that is listening.
+#|
+#| C<$progress> should increase on every call, C<:$total> is the count it is
+#| working towards when that is known, and C<:$message> is a line a UI can show.
+#| Both extras are omitted from the notification when they are not given, since
+#| C<ProgressNotificationParams> marks them optional and an absent total is not
+#| the same claim as a total of zero.
+method progress(Real:D $progress, Real :$total, Str :$message --> Bool:D) {
+	my $token = self.progress-token;
+	return False without $token;
+
+	self.emit-notification(notification('notifications/progress', {
+		progressToken => $token,
+		progress      => $progress,
+		|($total.defined   ?? (total => $total)     !! ()),
+		|($message.defined ?? (message => $message) !! ()),
+	}));
+}
+
 #| True once the caller has abandoned the request (an HTTP client closing the
 #| response stream, say).  A broken cancellation promise counts as cancelled: the
 #| signal itself failed, so the safe reading is that nobody is listening.
@@ -113,6 +180,7 @@ method with-broker($broker --> MCP::Server::Context:D) {
 		client-capabilities => %!client-capabilities,
 		emit => &!emit,
 		local-elicit => &!local-elicit,
+		progress-token => $!progress-token,
 		:$broker,
 		|($!cancelled.defined ?? (cancelled => $!cancelled) !! ()),
 	);

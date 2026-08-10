@@ -27,6 +27,13 @@ constant META-CLIENT-INFO         is export = 'io.modelcontextprotocol/clientInf
 constant META-SERVER-INFO         is export = 'io.modelcontextprotocol/serverInfo';
 constant META-LOG-LEVEL           is export = 'io.modelcontextprotocol/logLevel';
 
+# The one request _meta key with no reverse-DNS prefix on it: progressToken
+# predates the 2026-07-28 namespacing and both eras spell it the same way
+# (RequestMetaObject.progressToken in the 2026-07-28 schema, params._meta.
+# progressToken since 2024-11-05).  Its value is opaque to us and may be a
+# string or a number.
+constant META-PROGRESS-TOKEN      is export = 'progressToken';
+
 # RFC 5424 severity levels, least to most severe. Note: use Map.new rather than a
 # Hash literal here -- a `constant %h = { ... }` only freezes the container, not the
 # Hash object it points at, so the "constant" could still be mutated in place at
