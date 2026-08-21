@@ -16,6 +16,7 @@
   "perl": "6.d",
   "provides": {
     "MCP::Server": "lib/MCP/Server.rakumod",
+    "MCP::Server::Batch": "lib/MCP/Server/Batch.rakumod",
     "MCP::Server::CLI": "lib/MCP/Server/CLI.rakumod",
     "MCP::Server::Context": "lib/MCP/Server/Context.rakumod",
     "MCP::Server::DSL": "lib/MCP/Server/DSL.rakumod",
@@ -44,5 +45,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.5.0"
+  "version": "0.6.0"
 }

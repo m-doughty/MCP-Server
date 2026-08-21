@@ -2,6 +2,44 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.6.0  2026-08-21T20:54:08+01:00
+    - MCP::Server.new(:on-notify(...)): an in-process notification sink for the
+      host process that built the server. A server driven through
+      execute-tool-calls or handle-request has no client channel at all, so a
+      toolkit's out-of-band notifications -- a background job announcing that
+      it has finished -- were dropped for want of anywhere to put them. The
+      sink takes those: it sits behind a request's own channel (so nothing is
+      delivered twice), is not behind the legacy initialized gate (it is the
+      host's channel, not a client's), and out of a request is delivered to as
+      well as a connected transport. Calls into it are shielded -- a sink that
+      throws cannot take a job flusher thread down with it, and the failure is
+      reported once on $*ERR. The bridge's per-request context carries the same
+      sink, so $ctx.emit-notification from a tool handler reaches the host too.
+      The sink contract (leaf, non-blocking, called on arbitrary threads) is in
+      the Pod.
+    - The local LLM bridge now preserves a protocol tool result's
+      `structuredContent` as `structured_content`, while rendering `content`
+      exactly like MCP::Client's remote bridge. Local and remote toolkits can
+      carry machine metadata without changing what the model reads.
+    - Tools may be registered with the MCP `annotations` object --
+      `$server.tool: 'read', annotations => { readOnlyHint => True,
+      idempotentHint => True }, ...` -- which is published in the tools/list
+      catalog and readable back with $server.tool-annotations($name). The
+      spec's five keys (the four *Hint Bools and title) are type-checked at
+      registration; any other key travels untouched. tools-for-llm carries
+      none of it deliberately: those declarations go on an OpenAI-compatible
+      provider's wire verbatim, where an unrecognised member is a 400.
+    - execute-tool-calls now runs a batch whose calls are ALL annotated
+      readOnlyHint + idempotentHint on up to `tool-concurrency` workers
+      (default 4, `1` restores strict serial execution), and executes
+      identical calls in such a batch once -- the answer copied into each slot
+      that asked for it, under that slot's own tool_call_id. Any other batch
+      is serial and in model order exactly as before: one mutating call makes
+      the whole batch a sequence. Results are one per call, in the caller's
+      order, always. New MCP::Server::Batch holds the scheduler, which
+      MCP::Client's bridge shares so a toolkit behaves the same local or
+      remote.
+
 0.5.0  2026-08-10T19:54:48+01:00
     - $*MCP-REQUEST-CONTEXT.progress(...): a handler can now report progress
       on the request it is servicing. It honours the request's own

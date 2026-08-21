@@ -3,7 +3,7 @@ use lib 'lib';
 use JSON::Fast;
 use MCP::Server;
 
-plan 11;
+plan 12;
 
 my $server = MCP::Server.new(:name<test>);
 
@@ -212,6 +212,26 @@ subtest 'The tools run inside execute-tool-calls, not when the caller looks' => 
 	is @results.elems, 2, 'And the results were there waiting';
 	is @results[1]<content>, 'counted', 'With the answers the handlers gave';
 	is $lock.protect({ $calls }), 2, 'Reading them does not run anything a second time';
+};
+
+subtest 'structured tool results survive the local bridge without changing text' => {
+	plan 4;
+	my $structured = MCP::Server.new(:name<structured>);
+	$structured.tool: 'inspect', handler => -> :%args {
+		%(
+			content => [%( type => 'text', text => 'visible' ),],
+			structuredContent => %( revisionScheme => 'sha256-v1', value => 42 ),
+		);
+	};
+
+	my @results = $structured.execute-tool-calls([{
+		id => 'structured-1', function => { name => 'inspect', arguments => {} },
+	},]);
+	is @results[0]<content>, 'visible', 'the model-visible text is unchanged';
+	is @results[0]<structured_content><revisionScheme>, 'sha256-v1',
+		'the structured result is retained under the bridge key';
+	is @results[0]<structured_content><value>, 42, 'structured values are not stringified';
+	nok @results[0]<is_error>, 'a structured success remains a success';
 };
 
 done-testing;

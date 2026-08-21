@@ -257,9 +257,31 @@ until $resp.is-done { sleep 0.01 }
 say $resp.msg if $resp.is-success;
 ```
 
-`tools-for-llm` converts registered tools to the OpenAI function-calling format, sorted by name so the declarations a prompt carries are stable between runs. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back. Tool results include `role`, `tool_call_id`, `content`, and `is_error`.
+`tools-for-llm` converts registered tools to the OpenAI function-calling format, sorted by name so the declarations a prompt carries are stable between runs. `execute-tool-calls` routes the LLM's tool call requests to your registered handlers and returns results ready to send back. Tool results include `role`, `tool_call_id`, `content`, and `is_error`. When a handler returns a protocol result with `structuredContent`, the bridge also preserves it as `structured_content`; the model-visible `content` is rendered independently and is unchanged. This is the same key and rendering used by `MCP::Client`'s remote bridge.
 
 Each call's `arguments` may be a hash or the JSON string most APIs actually send; an empty or blank string means "no arguments", which is what models send for a tool that takes none. Anything else that is not a JSON object comes back as a result with `is_error` set, never as an exception.
+
+`tools-for-llm` deliberately carries **no annotations**: these declarations go on an OpenAI-compatible provider's wire verbatim, where an unrecognised member of a tool declaration is a 400 rather than an ignored field. Annotations are published where the protocol puts them — the `tools/list` catalog — and read back through `$server.tool-annotations($name) `.
+
+### How a batch is executed
+
+`execute-tool-calls` runs the calls it is given **serially, in model order** — unless **every** call in the batch names a tool annotated `readOnlyHint` and `idempotentHint`, in which case the distinct calls run on up to `$.tool-concurrency` workers (default 4). Three things hold either way:
+
+  * **Order is not an outcome.** Result *n* answers call *n*, whatever finished first, each under the `tool_call_id` of the call it answers.
+
+  * **One mutating call makes the batch a sequence.** A write, a command or a question for the user beside a read means the read waits its turn: a model that asked for both in one turn is describing an order, and the annotation is the only evidence there is that a call is not part of one.
+
+  * **Identical calls in a widened batch execute once**, the answer copied into each slot that asked for it. Two reads of one file is one read — one file opened, one lot of tokens back.
+
+```raku
+# Four annotated reads: up to four handlers at once, answers in order.
+my @results = $server.execute-tool-calls(@four-reads);
+
+# Never widen anything, whatever is annotated:
+my $strict = MCP::Server.new(:name<strict>, tool-concurrency => 1);
+```
+
+`MCP::Client`'s bridge does exactly the same with what a remote server annotated, so a toolkit is interchangeable local or remote in this too. See [MCP::Server::Batch](MCP::Server::Batch) for the scheduler both of them share.
 
 Resources
 ---------
@@ -448,11 +470,39 @@ A tool pack is its own zef distribution, named `MCP::Server::Tool::*` (e.g. `MCP
 
   * Depend on `"MCP::Server:auth<zef:apogee>"`, not on any specific server that happens to embed it — a well-behaved pack works equally as a one-shot `:tools` entry, a `.plug`-ed instance, or a config-file entry in any host server.
 
+  * Annotate the tools that only read — see below. It is the one piece of self-description a host can act on, and the pack is the only thing that knows the answer.
+
 Two reference packs ship as separate distributions and are worth reading as examples of the conventions above:
 
   * `MCP::Server::Tool::FileSystem` — root-confined file access.
 
   * `MCP::Server::Tool::Shell` — allowlisted command runner.
+
+### Annotations
+
+Every registration takes an optional `:%annotations`, the MCP `Tool.annotations` object. It is published in the `tools/list` catalog exactly as given, and it is what tells a host what calling the tool does:
+
+```raku
+$registrar.tool: 'read',
+    annotations => { readOnlyHint => True, idempotentHint => True },
+    description => 'Read a file from inside the server root',
+    params  => { path => { type => 'string', required => True } },
+    handler => -> :%args { ... };
+```
+
+The spec's keys are `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` (each a `Bool`) plus a human-facing `title` (a `Str`). Those five are type-checked at registration, because a `readOnlyHint => 'true' ` is a hint that reads as set and tests as unset everywhere it matters; any other key travels untouched, since the annotations object is open. A tool that declares nothing publishes no `annotations` member at all.
+
+**What this server does with them.** `readOnlyHint` and `idempotentHint` together — **both**, explicitly `True` — are a licence for `execute-tool-calls` to run a batch of such calls side by side and to execute identical calls in that batch once (see "LLM Tool Bridge" below). Nothing else here reads them; they are otherwise the pack's word to whichever client is listening.
+
+**So annotate honestly, and remember what the claim is about.** It is about the **handler**, not the intent:
+
+  * **Read-only** means the call changes nothing a later call could observe — not on this machine, not on a remote one.
+
+  * **Idempotent** means calling it again with the same arguments adds nothing. A tool that hands out a fresh handle, or asks a human a question, is not idempotent however little it writes.
+
+  * **Both together mean thread-safe against itself.** Two of them will be inside your handler at once. Anything they share — a memoised cache, a lazily-built client, a counter — needs a lock, and a lazy initialiser two callers can enter is the classic way to find that out the hard way.
+
+Anything you would not want run twice at once carries nothing. That is the safe direction, and it costs only the width of one batch.
 
 Examples
 --------
@@ -699,7 +749,7 @@ method modern-protocol-versions(--> List)  # configured versions in the modern e
 
   * A notification — a body with no `id` — is dispatched for its side effects and answered with an **empty Hash**, since JSON-RPC forbids replying to one. Transports turn that into whatever "accepted, nothing to say" looks like for them (`202` over HTTP).
 
-  * `:&notify` is called **synchronously, on the calling thread**, zero or more times, before the method returns. That is what lets a live stream carry a handler's log lines as they happen rather than after the fact. Leave it out and the request's notifications are dropped.
+  * `:&notify` is called **synchronously, on the calling thread**, zero or more times, before the method returns. That is what lets a live stream carry a handler's log lines as they happen rather than after the fact. Leave it out and the request's notifications are dropped — unless the server carries an `:&on-notify` sink, which picks up what the request had nowhere to put (see "The host as the client" below).
 
   * `:$cancelled` is a Promise the transport keeps for "the caller has walked away". It reaches handlers through `$*MCP-REQUEST-CONTEXT.cancelled`.
 
@@ -772,9 +822,41 @@ $server.notify(notification('notifications/progress', {
 
 The two things it does not do are the point of it. It never echoes to `$*ERR`, so a background job streaming its output to a client does not also spray the host process's terminal; and it applies no level gating, because `notifications/progress` has no level to gate on and a job's output should not be silenced by a `logging/setLevel` made for log lines. **Gating is therefore the caller's job**: a `notifications/message` raised this way should be sent only when `$*MCP-REQUEST-CONTEXT.wants-log($level)` agrees, since the 2026-07-28 rule that a server **must not** log for a request that did not opt in is not enforced here.
 
-It is safe to call from any thread — the bundled transports serialise their writes — which is what makes it usable from a `Supply.interval` flusher or a worker that outlives the request that started it. A modern request's notification still goes to that request's channel and nowhere else; out of a request the legacy rules apply, so nothing is sent before the client has said it is initialized.
+It is safe to call from any thread — the bundled transports serialise their writes — which is what makes it usable from a `Supply.interval` flusher or a worker that outlives the request that started it. A modern request's notification still goes to that request's channel and nowhere else; out of a request the legacy rules apply, so nothing is sent to a client before it has said it is initialized.
 
-The bridge is the one exception to "outside a request": a tool called through `execute-tool-calls` gets a legacy-era context with no notification sink, so a handler that reads the context works there too rather than dying on an undefined dynamic variable.
+### The host as the client
+
+None of those channels exists in a server nobody dials into — one built to be driven through `execute-tool-calls` or `handle-request` from the process that created it. Its toolkits still raise notifications, and a background job announcing that it has finished is worth hearing. `:&on-notify` is where they go:
+
+```raku
+my $events = Channel.new;
+
+my $server = MCP::Server.new(
+    :name<in-process>,
+    on-notify => -> %notification { $events.send(%notification) },
+);
+$server.plug: MCP::Server::Tool::Shell.new(allow => <make>);
+
+# ... later, on the host's own thread:
+react whenever $events -> %notification {
+    next unless %notification<method> eq 'notifications/job';
+    say "job {%notification<params><job>} is {%notification<params><state>}";
+}
+```
+
+The sink is called with the same `{ method => ..., params => ... } ` hash a transport would have written, and **the contract is narrow on purpose**:
+
+  * **Leaf.** It must not call back into the server, and least of all into `log` or `notify` — a sink that logs is a sink that notifies itself.
+
+  * **Non-blocking.** Hand the notification to a queue and return, as the `Channel` above does.
+
+  * **Thread-agnostic.** It is called on whatever thread raised the notification: a handler thread, a `Promise` watcher, a job flusher. Those flushers are a small shared pool, so a sink that blocks for a second stalls every job's output in the process for a second.
+
+  * **Shielded, not forgiven.** A throw is caught — it cannot take down the job flusher that called it — and the notification counts as delivered. The failure is reported once on `$*ERR` and that notification is gone. Do your own error handling inside the sink.
+
+Where it sits in the routing: last, and outside the handshake gate. A request with a channel of its own still wins outright, so nothing is delivered twice; a modern request with no sink, a legacy session that has not finished its handshake, and a server with no transport at all all reach the sink instead of dropping. Out of a request it is delivered to **as well as** a connected transport, because the host and the client are two audiences rather than two attempts at one.
+
+The bridge is the one exception to "outside a request": a tool called through `execute-tool-calls` gets a legacy-era context, so a handler that reads the context works there too rather than dying on an undefined dynamic variable. Its notification sink is the `:&on-notify` callback when there is one and nothing at all when there is not, which is what `$ctx.emit-notification` reports back either way.
 
 ### Progress
 

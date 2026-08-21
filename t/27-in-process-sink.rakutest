@@ -1,0 +1,255 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Context;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+
+# :on-notify is the channel for a server nobody dials into: one driven through
+# execute-tool-calls or handle-request by the process that built it, whose
+# toolkits still raise notifications (a background job announcing that it has
+# finished) that would otherwise have nowhere to go. Everything here is about
+# which of those notifications reach the host, how many times, and what a
+# badly-behaved sink can and cannot break.
+
+plan 6;
+
+#| Transport that plays a canned script of inbound lines and records everything
+#| the server writes.
+class ScriptedTransport does MCP::Server::Transport {
+	has @.inbound;
+	has @.written;
+
+	method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+	method write-message(Str:D $msg) { @!written.push($msg) }
+	method messages(--> List) { @!written.map({ from-json($_) }).list }
+}
+
+#| Stand-in for $*ERR so the server's own log lines — and the one warning a
+#| throwing sink earns — land in an array instead of the test output.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+#| A host sink: records what it was given, optionally throwing the first N
+#| times it is called, which is how a real one fails (a queue that has been
+#| closed, a window that has gone away).
+class HostSink {
+	has Int:D $.throws = 0;
+	has Lock $!lock .= new;
+	has @!seen;
+	has Int:D $!calls = 0;
+
+	method sink(--> Callable:D) { -> %notif { self.take(%notif) } }
+
+	method take(%notif --> Bool:D) {
+		my Bool:D $throw = $!lock.protect: { ++$!calls <= $!throws };
+		die 'the host sink has gone away' if $throw;
+		$!lock.protect: { @!seen.push(%notif) };
+		True;
+	}
+
+	method seen(--> List) { $!lock.protect: { @!seen.List } }
+	method calls(--> Int:D) { $!lock.protect: { $!calls } }
+	method data(--> List) { self.seen.map({ $_<params><data> }).list }
+}
+
+sub a-note(Str:D $text, Str:D $level = 'info' --> Hash) {
+	notification('notifications/message', { level => $level, logger => 'unit', data => $text });
+}
+
+# One tool call through the bridge, shaped the way a model's would be.
+sub bridge-call($server, Str:D $name, %arguments = {} --> Hash) {
+	$server.execute-tool-calls([
+		{ id => 'call-1', function => { name => $name, arguments => to-json(%arguments, :!pretty) } },
+	]).head.Hash;
+}
+
+subtest 'A server with no transport delivers to the host\'s sink' => {
+	plan 5;
+
+	# The whole point: no transport, no session, no handshake — and notify still
+	# has somewhere to go. This is the state a job flusher raises its lifecycle
+	# lines in.
+	my $host = HostSink.new;
+	my $server = MCP::Server.new(:name<in-process>, :version<1.0.0>, on-notify => $host.sink);
+
+	ok $server.notify(a-note('out of band')), 'notify reports it delivered';
+	is $host.data.List, ('out of band',), 'The host got it, once';
+	is-deeply $host.seen[0], a-note('out of band'),
+		'as the caller\'s own hash, untouched';
+
+	# log routes through notify, so the host hears log lines too — and the
+	# initialized gate, which is about a client on a transport, does not apply.
+	{
+		my $*ERR = ErrSink.new;
+		$server.log('warning', 'and log lines as well');
+	}
+	is $host.data.elems, 2, 'log reaches the same sink';
+	is $host.seen[1]<params><level>, 'warning', 'at the level it was logged';
+};
+
+subtest 'A tool called through the bridge emits on the host\'s channel' => {
+	plan 6;
+
+	my $host = HostSink.new;
+	my $server = MCP::Server.new(:name<bridge>, :version<1.0.0>, on-notify => $host.sink);
+
+	# Two ways a handler raises a notification, and both have to arrive: the
+	# per-request context (which now has a sink adapter) and the server itself.
+	$server.tool: 'chatty', :handler(-> :%args {
+		my $ctx = $*MCP-REQUEST-CONTEXT;
+		ok $ctx.emit-notification(a-note('from the context')),
+			'The bridge context reports a channel';
+		$server.notify(a-note('from the server'));
+		'done';
+	});
+
+	my %result = bridge-call($server, 'chatty');
+	is %result<content>, 'done', 'The call answered as it always did';
+	nok %result<is_error>, 'and did not fail';
+
+	is $host.data.List, ('from the context', 'from the server'),
+		'Both notifications reached the host, in order';
+	is $host.calls, 2, 'Neither of them twice: the context sink and notify are one channel';
+
+	# Out of the call the sink is still there — the bridge context is gone with
+	# the handler that had it, but the host's channel is the server's.
+	$server.notify(a-note('after the call'));
+	is $host.data.tail, 'after the call', 'and it outlives the call';
+};
+
+subtest 'A sink that throws breaks nothing' => {
+	plan 7;
+
+	# Failing exactly once, so the same sink can be watched recovering: a host
+	# whose queue is momentarily gone must not cost the tool call its answer,
+	# nor silence every notification after it.
+	my $host = HostSink.new(throws => 1);
+	my $server = MCP::Server.new(:name<fragile>, :version<1.0.0>, on-notify => $host.sink);
+
+	$server.tool: 'chatty', :handler(-> :%args {
+		$*MCP-REQUEST-CONTEXT.emit-notification(a-note('swallowed'));
+		$server.notify(a-note('heard'));
+		'still done';
+	});
+
+	my $err = ErrSink.new;
+	my %result = do {
+		my $*ERR = $err;
+		bridge-call($server, 'chatty');
+	};
+
+	is %result<content>, 'still done', 'The tool call returned its own result';
+	nok %result<is_error>, 'and was not turned into an error by the sink\'s failure';
+	is $host.data.List, ('heard',),
+		'The notification raised while it was broken is lost, the next one is not';
+
+	my @complaints = $err.lines.grep({ .contains('on-notify') });
+	is @complaints.elems, 1, 'The failure was reported on stderr';
+	ok @complaints[0].contains('fragile'), 'naming the server it belongs to';
+
+	# Warn-once: a sink that throws on every call would otherwise turn one bug
+	# into a stderr flood, a line per job flush.
+	my $flood = HostSink.new(throws => 99);
+	my $noisy = MCP::Server.new(:name<flooded>, :version<1.0.0>, on-notify => $flood.sink);
+	my $second = ErrSink.new;
+	{
+		my $*ERR = $second;
+		ok $noisy.notify(a-note('the first push')),
+			'A throwing sink still reports the notification delivered';
+		$noisy.notify(a-note("push $_")) for ^20;
+	}
+	is $second.lines.grep({ .contains('on-notify') }).elems, 1,
+		'Twenty-one failures, one complaint';
+};
+
+subtest 'No sink is the old behaviour, exactly' => {
+	plan 5;
+
+	# The pin: nothing about this feature may change a server that did not ask
+	# for it. No sink, no transport, nowhere to go — the notification is dropped
+	# and notify says so.
+	my $server = MCP::Server.new(:name<silent>, :version<1.0.0>);
+	nok $server.notify(a-note('nowhere at all')), 'Undelivered, and reported as such';
+
+	$server.tool: 'quiet', :handler(-> :%args {
+		my $ctx = $*MCP-REQUEST-CONTEXT;
+		ok $ctx.defined, 'The bridge still binds a context';
+		nok $ctx.emit-notification(a-note('into the void')),
+			'which reports no channel of its own';
+		nok $server.notify(a-note('nor through the server')),
+			'and the server has none either';
+		'quiet';
+	});
+
+	is bridge-call($server, 'quiet')<content>, 'quiet', 'The call is unaffected';
+};
+
+subtest 'A request with a channel of its own is not doubled' => {
+	plan 4;
+
+	my $host = HostSink.new;
+	my $server = MCP::Server.new(:name<both>, :version<1.0.0>, on-notify => $host.sink);
+
+	# A modern request carries its own sink. That one is the client's, it wins,
+	# and the host does not get a second copy of somebody else's mail.
+	my @sunk;
+	my $ctx = MCP::Server::Context.new(
+		era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+		emit => -> %notif { @sunk.push(%notif) },
+	);
+	ok (do { my $*MCP-REQUEST-CONTEXT = $ctx; $server.notify(a-note('for the client')) }),
+		'Delivered';
+	is @sunk.elems, 1, 'to the request\'s own channel';
+	is $host.calls, 0, 'and not to the host';
+
+	# A modern request with no sink of its own is the case that used to be a
+	# straight drop: request-scoped, so the transport must not have it — but the
+	# host is not another request's stream.
+	my $sinkless = MCP::Server::Context.new(
+		era => 'modern', protocol-version => MODERN-PROTOCOL-VERSION,
+	);
+	do { my $*MCP-REQUEST-CONTEXT = $sinkless; $server.notify(a-note('for the host')) };
+	is $host.data.List, ('for the host',), 'The host takes what the request could not';
+};
+
+subtest 'Out of a request the host and a connected client both hear it' => {
+	plan 5;
+
+	# Two audiences, not two attempts at one: a host that wants to watch its own
+	# jobs must not thereby take a legacy client's out-of-band notifications away
+	# from it.
+	my $host = HostSink.new;
+	my $server = MCP::Server.new(:name<dual>, :version<1.0.0>, on-notify => $host.sink);
+	my $transport = ScriptedTransport.new(inbound => (
+		{ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} },
+		{ jsonrpc => '2.0', method => 'notifications/initialized' },
+	).map({ to-json($_, :!pretty) }).Array);
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+
+	# The session logs on its own account, and those lines went to the host as
+	# well — including the startup one, raised before the client had said it was
+	# initialized, which is the gate not applying to a host that never shook
+	# anybody's hand.
+	ok $host.data.grep({ .contains('Starting MCP server') }).elems == 1,
+		'The host heard the session start, gate or no gate';
+
+	my Int $before = $transport.written.elems;
+	my Int $heard = $host.data.elems;
+	ok $server.notify(a-note('to everybody')), 'Delivered';
+	is $host.data[$heard .. *].List, ('to everybody',), 'The host heard it';
+	is $transport.written.elems, $before + 1, 'and so did the client, exactly once';
+	is from-json($transport.written.tail)<params><data>, 'to everybody',
+		'with the same payload on both channels';
+};
+
+done-testing;

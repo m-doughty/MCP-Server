@@ -1,0 +1,364 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Batch;
+
+plan 13;
+
+# The annotations a pack puts on a tool that reads and nothing else.
+my constant READS = { readOnlyHint => True, idempotentHint => True };
+
+# One tool call, as a model sends it.
+my sub call(Str:D $id, Str:D $name, %arguments = {}) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+# A server whose 'read' tool counts its executions and can be made slow, and
+# whose 'write' tool is the same thing without annotations.
+my sub counting-server(Real:D :$delay = 0, Int:D :$concurrency = 4) {
+	my $lock = Lock.new;
+	my Int $runs = 0;
+	my @overlaps;
+	my Int $in-flight = 0;
+
+	my &body = -> :%args {
+		$lock.protect: {
+			$runs++;
+			$in-flight++;
+			@overlaps.push($in-flight);
+		}
+		sleep $delay if $delay;
+		$lock.protect: { $in-flight-- };
+		'read:' ~ (%args<path> // '');
+	};
+
+	my $server = MCP::Server.new(
+		name => 'counting', tool-concurrency => $concurrency,
+	);
+	$server.tool: 'read',
+		annotations => READS,
+		params => { path => { type => 'string' } },
+		handler => &body;
+	$server.tool: 'write',
+		params => { path => { type => 'string' } },
+		handler => -> :%args {
+			$lock.protect: { $runs++ };
+			'write:' ~ (%args<path> // '');
+		};
+
+	%(
+		server => $server,
+		runs   => -> { $lock.protect: { $runs } },
+		peak   => -> { $lock.protect: { @overlaps.max // 0 } },
+	);
+}
+
+subtest 'annotations are stored, published, and readable by name' => {
+	plan 6;
+
+	my $server = MCP::Server.new(:name<annotated>);
+	$server.tool: 'read',
+		annotations => READS,
+		handler => -> :%args { 'r' };
+	$server.tool: 'write', handler => -> :%args { 'w' };
+
+	is-deeply $server.tool-annotations('read'),
+		%( readOnlyHint => True, idempotentHint => True ),
+		'the hints come back under the name they were registered with';
+	is-deeply $server.tool-annotations('write'), %(),
+		'a tool that declared none has an empty Hash, not an undefined one';
+	is-deeply $server.tool-annotations('nonesuch'), %(),
+		'and so does a tool this server does not have';
+
+	my %listed = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list', params => {},
+	});
+	my %read = %listed<result><tools>.first({ $_<name> eq 'read' });
+	my %write = %listed<result><tools>.first({ $_<name> eq 'write' });
+	is-deeply %read<annotations>,
+		%( readOnlyHint => True, idempotentHint => True ),
+		'tools/list carries them where the MCP schema puts them';
+	nok %write<annotations>:exists,
+		'and says nothing at all for a tool with nothing to say — an empty '
+			~ 'annotations object is noise in every catalog that carries it';
+
+	# The declarations go on an OpenAI-compatible provider's wire verbatim,
+	# where an unrecognised member is a 400 rather than an ignored field.
+	my %decl = $server.tools-for-llm.first({ $_<function><name> eq 'read' });
+	is-deeply %decl.keys.sort.List, ('function', 'type'),
+		'the LLM declarations are untouched: annotations are protocol, not '
+			~ 'a function-calling field';
+};
+
+subtest 'a hint has to be a Bool, and it is refused at registration' => {
+	plan 3;
+
+	my $server = MCP::Server.new(:name<validating>);
+	throws-like { $server.tool: 'a',
+			annotations => { readOnlyHint => 'true' },
+			handler => -> :%args { '' } },
+		Exception, message => /'readOnlyHint'/,
+		'a string where a Bool belongs is refused, naming the key';
+	throws-like { $server.tool: 'b',
+			annotations => { title => 42 },
+			handler => -> :%args { '' } },
+		Exception, message => /'title'/,
+		'and so is a title that is not a string';
+
+	lives-ok { $server.tool: 'c',
+			annotations => { 'com.example/ours' => 'yes' },
+			handler => -> :%args { '' } },
+		'while a key the spec has never heard of travels untouched — the '
+			~ 'annotations object is open';
+};
+
+subtest 'an annotated batch really does overlap' => {
+	plan 3;
+
+	# Slow enough that serial execution could not possibly finish inside the
+	# window this asserts on, and short enough that the file is not a wait.
+	my %rig = counting-server(delay => 0.4, concurrency => 4);
+	my @calls = (^4).map({ call("c$_", 'read', %( path => "f$_" )) });
+
+	my $began = now;
+	my @results = %rig<server>.execute-tool-calls(@calls);
+	my $elapsed = now - $began;
+
+	is @results.map({ $_<content> }).List,
+		('read:f0', 'read:f1', 'read:f2', 'read:f3'),
+		'four distinct reads, in the order the model asked for them';
+	ok %rig<peak>() > 1,
+		'more than one handler was inside the tool at the same time';
+	ok $elapsed < 1.2,
+		"four 0.4s reads took {$elapsed.round(0.01)}s, not the 1.6s of a "
+			~ 'queue';
+};
+
+subtest 'a batch is only widened when EVERY call is annotated' => {
+	plan 3;
+
+	my %rig = counting-server(delay => 0.2);
+	my @calls = (
+		call('a', 'read',  %( path => 'one' )),
+		call('b', 'write', %( path => 'two' )),
+		call('c', 'read',  %( path => 'three' )),
+	);
+
+	my $began = now;
+	my @results = %rig<server>.execute-tool-calls(@calls);
+	my $elapsed = now - $began;
+
+	is @results.map({ $_<content> }).List,
+		('read:one', 'write:two', 'read:three'),
+		'the answers are in model order';
+	is %rig<peak>(), 1,
+		'and nothing ever overlapped: one unannotated call makes the whole '
+			~ 'batch a sequence, because the read beside a write may be '
+			~ 'reading what that write just did';
+	ok $elapsed >= 0.4, 'which is two 0.2s reads one after the other';
+};
+
+subtest 'two identical calls in a widened batch execute once' => {
+	plan 4;
+
+	my %rig = counting-server;
+	my @calls = (
+		call('a', 'read', %( path => 'same.txt' )),
+		call('b', 'read', %( path => 'same.txt' )),
+		call('c', 'read', %( path => 'other.txt' )),
+	);
+
+	my @results = %rig<server>.execute-tool-calls(@calls);
+
+	is %rig<runs>(), 2, 'three calls, two executions — the duplicate is fanned out';
+	is @results.map({ $_<content> }).List,
+		('read:same.txt', 'read:same.txt', 'read:other.txt'),
+		'and every slot still has its answer';
+	is @results.map({ $_<tool_call_id> }).List, ('a', 'b', 'c'),
+		'each under the id of the call it answers, which is the thing a '
+			~ 'copied answer must not get wrong';
+
+	# Argument ORDER is spelling; argument CONTENT is identity.
+	my %rig2 = counting-server;
+	%rig2<server>.execute-tool-calls((
+		%( id => 'a', function => %( name => 'read',
+			arguments => '{"path":"x","depth":1}' ) ),
+		%( id => 'b', function => %( name => 'read',
+			arguments => '{"depth":1,"path":"x"}' ) ),
+	));
+	is %rig2<runs>(), 1,
+		'and the same arguments in a different order are the same call';
+};
+
+subtest 'a serial batch never de-duplicates' => {
+	plan 2;
+
+	# Because without the annotation, "the model asked twice" has to mean
+	# twice: nothing says the second call could not have seen something
+	# different.
+	my %rig = counting-server;
+	my @results = %rig<server>.execute-tool-calls((
+		call('a', 'write', %( path => 'x' )),
+		call('b', 'write', %( path => 'x' )),
+	));
+
+	is %rig<runs>(), 2, 'both unannotated calls ran';
+	is @results.map({ $_<tool_call_id> }).List, ('a', 'b'), 'in order';
+};
+
+subtest 'fifty reads answer exactly as fifty serial reads would' => {
+	plan 3;
+
+	my @calls = (^50).map({ call("c$_", 'read', %( path => "f{$_ % 7}" )) });
+
+	my %serial = counting-server(concurrency => 1);
+	my @one-at-a-time = %serial<server>.execute-tool-calls(@calls);
+
+	my %wide = counting-server(concurrency => 8);
+	my @widened = %wide<server>.execute-tool-calls(@calls);
+
+	is-deeply @widened.map({ $_.Hash }).List,
+		@one-at-a-time.map({ $_.Hash }).List,
+		'result for result, key for key, the two are the same list';
+	is %serial<runs>(), 50, 'fifty executions when nothing may be shared';
+	is %wide<runs>(), 7,
+		'and seven when it may — there are only seven distinct paths in '
+			~ 'those fifty calls';
+};
+
+subtest 'tool-concurrency 1 is the old behaviour, exactly' => {
+	plan 2;
+
+	my %rig = counting-server(delay => 0.15, concurrency => 1);
+	my $began = now;
+	%rig<server>.execute-tool-calls(
+		(^3).map({ call("c$_", 'read', %( path => "f$_" )) }));
+	my $elapsed = now - $began;
+
+	is %rig<peak>(), 1, 'nothing overlaps at a width of one';
+	ok $elapsed >= 0.45, 'three 0.15s reads one after another';
+};
+
+subtest 'a width below one is refused at construction' => {
+	plan 2;
+
+	throws-like { MCP::Server.new(name => 'zero', tool-concurrency => 0) },
+		Exception, message => /'tool-concurrency'/,
+		'zero is not a batch width, it is no batch at all';
+	throws-like { MCP::Server.new(name => 'neg', tool-concurrency => -1) },
+		Exception, message => /'tool-concurrency'/,
+		'and neither is a negative one';
+};
+
+subtest 'errors in a widened batch stay with the call that caused them' => {
+	plan 4;
+
+	my $server = MCP::Server.new(name => 'mixed-luck');
+	$server.tool: 'read',
+		annotations => READS,
+		params => { path => { type => 'string' } },
+		handler => -> :%args {
+			die 'no such file' if (%args<path> // '') eq 'missing';
+			'read:' ~ %args<path>;
+		};
+
+	my @results = $server.execute-tool-calls((
+		call('a', 'read', %( path => 'here' )),
+		call('b', 'read', %( path => 'missing' )),
+		call('c', 'read', %( path => 'also-here' )),
+		%( id => 'd', function => %( name => 'read', arguments => 'not json' ) ),
+	));
+
+	is @results.map({ $_<tool_call_id> }).List, <a b c d>.List,
+		'four answers, in order';
+	is-deeply @results.map({ $_<is_error> }).List,
+		(False, True, False, True),
+		'and the failures are exactly the calls that failed';
+	like @results[1]<content>, /'no such file'/, 'the handler said why';
+	like @results[3]<content>, /'Invalid tool arguments JSON'/,
+		'and so did the parser — an unparseable call is answered, not run';
+};
+
+subtest 'an unknown tool keeps its batch serial' => {
+	plan 2;
+
+	# Conservative on purpose: a name this server does not have is a name it
+	# has no annotation for, and "no annotation" is the whole of the reason
+	# not to widen anything.
+	my %rig = counting-server(delay => 0.2);
+	my @results = %rig<server>.execute-tool-calls((
+		call('a', 'read', %( path => 'x' )),
+		call('b', 'nonesuch'),
+		call('c', 'read', %( path => 'y' )),
+	));
+
+	is @results[1]<content>, "Unknown tool: 'nonesuch'",
+		'the unknown call is answered where the model can read it';
+	is %rig<peak>(), 1, 'and the calls around it ran one at a time';
+};
+
+subtest 'the width is a ceiling, not a suggestion' => {
+	plan 2;
+
+	# Six slow reads at a width of two: what makes this a BOUND rather than a
+	# hint is that there are only ever two workers, so a batch of any size
+	# cannot conjure a thread per call.
+	my %rig = counting-server(delay => 0.25, concurrency => 2);
+	my $began = now;
+	%rig<server>.execute-tool-calls(
+		(^6).map({ call("c$_", 'read', %( path => "f$_" )) }));
+	my $elapsed = now - $began;
+
+	is %rig<peak>(), 2, 'never more than two handlers at once';
+	ok $elapsed >= 0.5,
+		'six 0.25s reads two at a time is three waits, not one — the ceiling '
+			~ 'is real';
+};
+
+subtest 'the scheduler itself: what it promises callers of both bridges' => {
+	plan 9;
+
+	ok concurrency-safe({ readOnlyHint => True, idempotentHint => True }),
+		'both hints, both True: safe';
+	nok concurrency-safe({ readOnlyHint => True }),
+		'read-only alone is not enough — a tool that reads and is not '
+			~ 'idempotent is still hostile to being run twice';
+	nok concurrency-safe({ readOnlyHint => 'true', idempotentHint => 'true' }),
+		'and a string that looks like a hint is not one';
+	nok concurrency-safe(Any), 'nothing at all is a no';
+
+	# A thunk that throws becomes that slot's error, not the batch's death.
+	my @out = run-tool-batch((
+		%( id => 'a', concurrent => True, key => 'k1',
+		   work => -> { die 'thunk exploded' } ),
+		%( id => 'b', concurrent => True, key => 'k2',
+		   work => -> { %( role => 'tool', tool_call_id => 'b',
+		                   content => 'fine', is_error => False ) } ),
+	), concurrency => 2);
+	is @out.elems, 2, 'a throwing unit of work does not take the batch down';
+	like @out[0]<content>, /'thunk exploded'/,
+		'it becomes the error result for its own slot';
+
+	# An undefined key is "never de-duplicate this one", which is what a slot
+	# that cannot say what it is asking for has to mean.
+	my Int $ran = 0;
+	my $lock = Lock.new;
+	my &work = -> {
+		$lock.protect: { $ran++ };
+		%( role => 'tool', tool_call_id => '', content => 'x', is_error => False );
+	};
+	run-tool-batch((
+		%( id => 'a', concurrent => True, key => Str, work => &work ),
+		%( id => 'b', concurrent => True, key => Str, work => &work ),
+	), concurrency => 2);
+	is $ran, 2, 'two keyless slots are two executions';
+
+	# And an identity is arguments by content, not by spelling.
+	is argument-identity('read', %( b => 2, a => 1 )),
+		argument-identity('read', %( a => 1, b => 2 )),
+		'the same arguments in a different order are the same call';
+	isnt argument-identity('read', %( a => 1 )),
+		argument-identity('list', %( a => 1 )),
+		'while the same arguments to a different tool are not';
+};

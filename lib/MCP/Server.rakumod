@@ -9,6 +9,11 @@ use MCP::Server::Prompt;
 use MCP::Server::Transport;
 use MCP::Server::Transport::Stdio;
 
+# Last among the sibling uses on purpose: a module of this distribution that is
+# `use`d before the others can shadow a name they export, and this one is the
+# newest arrival.
+use MCP::Server::Batch;
+
 #| Facade over an MCP::Server that namespaces everything registered through it.
 #| Tools and prompts become "{prefix}{sep}{name}" (underscore by default, which
 #| keeps generated names inside the MCP tool-name charset); resource URIs get
@@ -39,8 +44,9 @@ class MCP::Server::Registrar {
 		"{$!prefix}/{$uri}";
 	}
 
-	method tool(Str:D $name, Str :$description, :%params, :&handler!) {
-		$!server.tool: self.prefixed($name), :$description, :%params, :&handler;
+	method tool(Str:D $name, Str :$description, :%params, :%annotations, :&handler!) {
+		$!server.tool: self.prefixed($name),
+			:$description, :%params, :%annotations, :&handler;
 	}
 
 	method prompt(Str:D $name, Str :$description, :@arguments, :&handler!) {
@@ -140,6 +146,50 @@ has Lock $!elicitations-lock .= new;
 # everything through, which is what the server did before setLevel existed.
 has Str:D $!min-log-level = 'debug';
 
+#| Where notifications go when the host process itself is the client: an
+#| in-process sink, called as C<< on-notify(%notification) >> with the same
+#| C<< { method => ..., params => ... } >> hash a transport would have written.
+#| Undefined leaves every routing decision exactly as it was.
+#|
+#| This is the channel for a server nobody dials into — one built to be driven
+#| through C<execute-tool-calls> or C<handle-request>, whose toolkits still
+#| raise notifications (a background job announcing that it has finished, say)
+#| that would otherwise be dropped for want of anywhere to put them.
+#|
+#| B<The sink contract>, because it is not a place to be clever:
+#|
+#| =item B<Leaf.>  It must not call back into this server, and least of all into
+#|       C<log> or C<notify> — a sink that logs is a sink that notifies itself.
+#| =item B<Non-blocking.>  Hand the notification to a queue and return.
+#| =item B<Thread-agnostic.>  It is called on whatever thread raised the
+#|       notification: a handler thread, a C<Promise> watcher, a job flusher.
+#|       Every job in the process shares a small pool of those, so a sink that
+#|       blocks for a second stalls every job's output for a second.
+#| =item B<Shielded, not forgiven.>  A sink that throws cannot take the caller
+#|       down with it — the throw is caught here and the notification counts as
+#|       delivered — but the failure is reported once on C<$*ERR> and the
+#|       notification is gone.  Do your own error handling inside it.
+#|
+#| See L<#method notify> for which notifications reach it and in what order.
+has &.on-notify;
+
+# Warn-once state for a throwing sink.  Once, because the failure mode is a
+# sink that throws on every call, and a job flushing output every second would
+# otherwise turn one bug into a stderr flood.
+has Lock $!notify-sink-lock .= new;
+has Bool:D $!notify-sink-warned = False;
+
+#| How many calls of one C<execute-tool-calls> batch may run at once, when
+#| every call in that batch is annotated read-only and idempotent.  Four: wide
+#| enough that a turn asking to read six files is not six waits in a row,
+#| narrow enough that a batch cannot conjure a thread per call.
+#|
+#| C<1> turns the widening off entirely — every batch runs the way it did
+#| before annotations existed.  It is the setting for a host that would rather
+#| have one thing happening at a time than have to reason about a pack's
+#| thread-safety.
+has Int:D $.tool-concurrency = 4;
+
 #| Transport settings carried through from the config file's optional "http"
 #| section (port/host/path/allowedOrigins), for whoever starts a transport with
 #| this server — the CLI, normally.  The server itself never reads it: it is
@@ -169,18 +219,60 @@ submethod TWEAK(:@tools) {
 	  ~ "got $!max-pending-elicitations"
 		if $!max-pending-elicitations < 1;
 
+	die "tool-concurrency for MCP server '$!name' must be at least one, "
+	  ~ "got $!tool-concurrency"
+		if $!tool-concurrency < 1;
+
 	self!load-tool-entry($_) for @tools;
 }
 
 # === Registration API ===
 
-method tool(Str:D $name, Str :$description, :%params, :&handler!) {
+#| Register a tool.  C<:%annotations> is the MCP C<Tool.annotations> object —
+#| C<readOnlyHint>, C<idempotentHint>, C<destructiveHint>, C<openWorldHint>
+#| (Bools) and C<title> (a Str) — published in the C<tools/list> catalog and
+#| read back by C<execute-tool-calls> when it decides how to run a batch.  See
+#| the "Annotations" section of the Pod for what a pack author should declare
+#| and what the server does with it.
+method tool(Str:D $name, Str :$description, :%params, :%annotations, :&handler!) {
 	die "Invalid tool name '$name': MCP tool names must be 1 to 128 characters of [A-Za-z0-9_-]"
 		unless $name ~~ &mcp-tool-name;
 	die "Duplicate tool '$name' on MCP server '$!name'; register one of the providers "
 	  ~ "under a prefix, e.g. \$server.plug(\$kit, :prefix<other>)"
 		if %!tools{$name}:exists;
-	%!tools{$name} = MCP::Server::Tool.new(:$name, :$description, :%params, :&handler);
+	check-annotations($name, %annotations, $!name);
+	%!tools{$name} = MCP::Server::Tool.new(
+		:$name, :$description, :%params, :%annotations, :&handler,
+	);
+}
+
+# The annotation keys the spec gives a type to, checked at REGISTRATION rather
+# than at publication: a `readOnlyHint => 'true'` typed as a string is a hint
+# that reads as set and tests as unset everywhere it matters (the batch
+# scheduler wants a Bool), and finding that out from a tool that quietly never
+# batches is a bad afternoon.  Unknown keys travel untouched -- the annotations
+# object is open, and a pack author with a hint of their own is not making a
+# mistake.
+my constant ANNOTATION-BOOLS = <readOnlyHint destructiveHint idempotentHint openWorldHint>;
+
+my sub check-annotations(Str:D $tool, %annotations, Str:D $server --> Nil) {
+	for ANNOTATION-BOOLS -> $key {
+		next unless %annotations{$key}:exists;
+		die "Invalid annotation '$key' for tool '$tool' on MCP server '$server': "
+		  ~ "expected True or False, got {%annotations{$key}.raku}"
+			unless %annotations{$key} ~~ Bool:D;
+	}
+	die "Invalid annotation 'title' for tool '$tool' on MCP server '$server': "
+	  ~ "expected a string, got {%annotations<title>.raku}"
+		if (%annotations<title>:exists) && %annotations<title> !~~ Str:D;
+}
+
+#| The annotations declared for C<$name>, as a copy, or an empty Hash for a
+#| tool that declared none (or one this server does not have).  What a host
+#| consults when it wants to know whether a call reads or writes without
+#| rendering the whole catalog.
+method tool-annotations(Str:D $name --> Hash:D) {
+	%!tools{$name}:exists ?? %!tools{$name}.annotations.Hash !! %();
 }
 
 method tool-group(Str:D $prefix, &registrar) {
@@ -384,6 +476,13 @@ my sub http-config-from($section, $path --> Hash) {
 #| not stable in Raku, and a model's tool declarations end up in a prompt that is
 #| cached and compared.  It also means this agrees, entry for entry, with what a
 #| client built on top of C<tools/list> declares.
+#|
+#| B<Annotations are deliberately not here.>  These declarations go on an
+#| OpenAI-compatible provider's wire verbatim, where an unrecognised member of
+#| a tool declaration is a 400 and not an ignored field.  A tool's annotations
+#| are published where the protocol puts them — the C<tools/list> catalog — and
+#| read back through L<#method tool-annotations>, which is where this server's
+#| own batch scheduler gets them.
 method tools-for-llm(--> List) {
 	%!tools.values.sort(*.name).map(-> $tool {
 		{
@@ -397,81 +496,206 @@ method tools-for-llm(--> List) {
 	}).list;
 }
 
+#|( Run the tool calls a model asked for and return one result each, in the
+    same order: C<< { role => 'tool', tool_call_id, content, is_error } >>.
+
+    B<Never throws.>  A malformed call, arguments that are not a JSON object, a
+    tool this server does not have, a handler that died — each comes back as a
+    result with C<is_error> set and the reason as its content, because a model
+    that can read what went wrong can try something else.
+
+    B<The concurrency contract.>  The batch runs B<serially, in model order>,
+    exactly as it always has, unless B<every> call in it names a tool annotated
+    C<readOnlyHint> B<and> C<idempotentHint> — in which case the distinct calls
+    run on up to C<$.tool-concurrency> workers and the answers are reassembled
+    in slot order.  Three things are true either way, and they are the whole of
+    what a caller may rely on:
+
+    =item B<Order is not an outcome.>  Result I<n> answers call I<n>, whatever
+          finished first, and each carries the C<tool_call_id> of the call it
+          answers.
+    =item B<One mutating call makes the batch a sequence.>  A write, a shell
+          command or a question for the user beside a read means the read waits
+          its turn — a model that asked for both in one turn is describing an
+          order, and the annotation is the only evidence there is that a call
+          is not part of one.
+    =item B<Identical calls in a widened batch execute once>, the answer copied
+          into each slot that asked for it.  Two C<fs_read>s of one path is one
+          read, and one lot of tokens.
+
+    Handlers of annotated tools therefore have to be thread-safe against
+    themselves; that is what the annotation asserts.  Setting
+    C<< :tool-concurrency(1) >> restores strict serial execution for every
+    batch.  See L<MCP::Server::Batch> for the scheduler itself. )
 method execute-tool-calls(@tool-calls --> List) {
-	# Assigned to an array rather than returned as a `.map(...).list`: a Seq's
-	# .list is still lazy, so the handlers would run at whatever point the caller
-	# first looked at the result -- on another thread, after a cancellation, or
-	# never.  Tools have side effects; they run here, inside the method that was
-	# asked to run them.  MCP::Client's bridge is eager for the same reason.
-	my @results = @tool-calls.map(-> %tc {
-		my $fn-name = %tc<function><name>;
-		my $args = %tc<function><arguments> // {};
-		my $call-id = %tc<id> // '';
+	# Every slot's arguments are parsed up front -- which is pure, and cheap --
+	# so that what the scheduler runs is the tool call and nothing else.  The
+	# results are a real List and not a lazy Seq: a Seq's .list would leave the
+	# handlers to run at whatever point the caller first looked at the answers,
+	# on another thread, after a cancellation, or never.  Tools have side
+	# effects; they happen here, inside the method that was asked to run them.
+	# MCP::Client's bridge is eager for the same reason.
+	my @slots = @tool-calls.map(-> %tc { self!bridge-slot(%tc) });
+	run-tool-batch(@slots, concurrency => $!tool-concurrency);
+}
 
-		my %arguments;
-		my $result;
-		my $is-error = False;
+# One call's slot for the batch scheduler: what it may run beside, what makes
+# it identical to another call, and the thunk that answers it.
+method !bridge-slot(%tc --> Hash:D) {
+	my $fn-name = %tc<function><name>;
+	my $args = %tc<function><arguments> // {};
+	my $call-id = %tc<id> // '';
 
-		if $args ~~ Associative {
-			%arguments = $args.Hash;
-		} elsif $args.Str.trim eq '' {
-			# Models routinely send "" as the arguments of a tool that takes none.
-			# That is a call with no arguments, not a broken one, so it runs with
-			# the empty %arguments already declared above rather than coming back
-			# as a parse error the model cannot act on.
-		} else {
-			try {
-				my $parsed = from-json($args.Str);
-				if $parsed ~~ Associative {
-					%arguments = $parsed.Hash;
-				} else {
-					$result = 'Tool arguments must be a JSON object';
-					$is-error = True;
+	my %arguments;
+	my Str $parse-error;
+
+	if $args ~~ Associative {
+		%arguments = $args.Hash;
+	} elsif $args.Str.trim eq '' {
+		# Models routinely send "" as the arguments of a tool that takes none.
+		# That is a call with no arguments, not a broken one, so it runs with
+		# the empty %arguments already declared above rather than coming back
+		# as a parse error the model cannot act on.
+	} else {
+		try {
+			my $parsed = from-json($args.Str);
+			$parse-error = $parsed ~~ Associative
+				?? Str
+				!! 'Tool arguments must be a JSON object';
+			%arguments = $parsed.Hash if $parsed ~~ Associative;
+			CATCH {
+				default {
+					$parse-error = "Invalid tool arguments JSON: {.message}";
 				}
+			}
+		}
+	}
+
+	my Str $known-name = $fn-name ~~ Str:D && (%!tools{$fn-name}:exists)
+		?? $fn-name !! Str;
+
+	%(
+		id => $call-id,
+		# A call whose tool this server does not have is never widened: it is
+		# an error result and nothing else, but "we have no annotation for it"
+		# is exactly the case this decision is conservative about.
+		concurrent => $known-name.defined
+			&& concurrency-safe(%!tools{$known-name}.annotations),
+		# A call that never reaches a handler is never de-duplicated either --
+		# there is nothing to save, and an undefined key says so.
+		key => $known-name.defined && !$parse-error.defined
+			?? argument-identity($known-name, %arguments)
+			!! Str,
+		work => -> {
+			self!run-bridge-call($fn-name, %arguments, $call-id, $parse-error);
+		},
+	);
+}
+
+# One call, rendered as the tool message the model reads.  Runs on whichever
+# thread the scheduler picked, which is why every piece of state it touches is
+# either a parameter, an immutable attribute (%!tools is frozen once
+# registration is done) or something that carries its own lock.
+method !run-bridge-call($fn-name, %arguments, $call-id, Str $parse-error --> Hash:D) {
+	my $result = $parse-error;
+	my $structured;
+	my $is-error = $parse-error.defined;
+
+	if !$is-error {
+		if %!tools{$fn-name}:exists {
+			try {
+				# There is no request here -- the model is calling the tool
+				# through us, not through MCP -- but a handler that reaches
+				# for $*MCP-REQUEST-CONTEXT still deserves an object rather
+				# than an Any it will die on.  Legacy era, because nothing
+				# about this path is 2026-07-28, and carrying :on-elicit so
+				# a tool that asks the user can still be answered locally.
+				#
+				# Declared inside this method rather than around the batch:
+				# a widened batch runs its calls on several threads, and a
+				# dynamic variable belongs to the call that is using it.
+				#
+				# The sink is wired only when the host gave us one: an
+				# undefined Context.emit means "no channel", which is what
+				# $ctx.emit-notification reports back to a handler deciding
+				# whether to bother building a payload.  With one, a
+				# per-request $ctx.emit-notification reaches the host too.
+				# Exactly once, either way: a notification raised through
+				# the server rather than the context takes notify's legacy
+				# path, which delivers to the sink itself when this context
+				# has not already carried it there.
+				my $*MCP-REQUEST-CONTEXT = MCP::Server::Context.new(
+					era => 'legacy', local-elicit => &!on-elicit,
+					|(&!on-notify.defined
+						?? (emit => -> %notif { self!emit-in-process(%notif); True })
+						!! ()),
+				);
+				$result = %!tools{$fn-name}.call(%arguments);
 				CATCH {
 					default {
-						$result = "Invalid tool arguments JSON: {.message}";
+						$result = .message;
 						$is-error = True;
 					}
 				}
 			}
+		} else {
+			$result = "Unknown tool: '$fn-name'";
+			$is-error = True;
 		}
+	}
 
-		if !$is-error {
-			if %!tools{$fn-name}:exists {
-				try {
-					# There is no request here -- the model is calling the tool
-					# through us, not through MCP -- but a handler that reaches
-					# for $*MCP-REQUEST-CONTEXT still deserves an object rather
-					# than an Any it will die on.  Legacy era, because nothing
-					# about this path is 2026-07-28, and carrying :on-elicit so
-					# a tool that asks the user can still be answered locally.
-					my $*MCP-REQUEST-CONTEXT = MCP::Server::Context.new(
-						era => 'legacy', local-elicit => &!on-elicit,
-					);
-					$result = %!tools{$fn-name}.call(%arguments);
-					CATCH {
-						default {
-							$result = .message;
-							$is-error = True;
-						}
-					}
+	if !$is-error && $result ~~ Associative {
+		my %wire = $result.Hash;
+		$structured = %wire<structuredContent>
+			if %wire<structuredContent> ~~ Associative;
+		$is-error = ?%wire<isError>;
+		$result = bridge-result-text(%wire);
+	}
+
+	%(
+		role => 'tool',
+		tool_call_id => $call-id,
+		content => ~($result // ''),
+		is_error => $is-error,
+		|($structured.defined ?? (structured_content => $structured) !! ()),
+	);
+}
+
+# Render a protocol tool result for the model while retaining its structured
+# twin separately.  This deliberately matches MCP::Client's remote bridge: a
+# local toolkit and that same toolkit reached over MCP must be interchangeable.
+my sub bridge-result-text(%result --> Str:D) {
+	my $content = %result<content>;
+	unless $content ~~ Positional {
+		return '' unless %result.elems;
+		return to-json(%result, :!pretty, :sorted-keys);
+	}
+
+	$content.list.map(-> $block {
+		if $block !~~ Associative {
+			~($block // '');
+		}
+		else {
+			my %block = $block.Hash;
+			given (%block<type> // '').Str {
+				when 'text' { ~(%block<text> // '') }
+				when 'image' | 'audio' {
+					"[{%block<type>}: {(%block<mimeType> // 'unknown media type').Str}]"
 				}
-			} else {
-				$result = "Unknown tool: '$fn-name'";
-				$is-error = True;
+				when 'resource' {
+					my %embedded = %block<resource> ~~ Associative
+						?? %block<resource>.Hash !! {};
+					%embedded<text> ~~ Str:D
+						?? %embedded<text>
+						!! "[resource: {(%embedded<uri> // 'unknown').Str}]";
+				}
+				when 'resource_link' {
+					"[resource: {(%block<uri> // 'unknown').Str}]"
+				}
+				default { to-json(%block, :!pretty, :sorted-keys) }
 			}
 		}
-
-		{
-			role => 'tool',
-			tool_call_id => $call-id,
-			content => ~($result // ''),
-			is_error => $is-error,
-		};
-	});
-
-	@results.List;
+	}).join("\n");
 }
 
 # === Run loop ===
@@ -529,7 +753,9 @@ method handle-request(%msg --> Hash) {
 #| effects and answered with an empty Hash, since JSON-RPC forbids a response.
 #|
 #| :&notify is called synchronously on the calling thread, zero or more times,
-#| before this method returns; leaving it out drops the request's notifications.
+#| before this method returns; leaving it out drops the request's notifications
+#| — unless the server was built with an :&on-notify sink, which takes what the
+#| request itself had nowhere to put.
 #| :$cancelled is surfaced to handlers through $*MCP-REQUEST-CONTEXT.cancelled.
 #|
 #| Touches no server state, so concurrent calls are safe as far as this class is
@@ -917,11 +1143,23 @@ method log(Str:D $level, Str:D $message --> Nil) {
 #| handler to dig it out of C<_meta> itself.
 #|
 #| Routing is the same as C<log>'s, and so is era-aware: inside a modern-era
-#| request it goes to that request's channel and nowhere else (undelivered, and
-#| False, when the request has no sink); otherwise it follows the legacy rules —
-#| nothing at all before the client has said it is initialized, then the
-#| request's own sink if there is one, then the shared transport, which is where
-#| a legacy session's out-of-band notifications belong.
+#| request it goes to that request's channel and nowhere else; otherwise it
+#| follows the legacy rules — nothing at all before the client has said it is
+#| initialized, then the request's own sink if there is one, then the shared
+#| transport, which is where a legacy session's out-of-band notifications
+#| belong.
+#|
+#| A configured C<:&on-notify> sits behind all of those and is never behind the
+#| handshake gate: it belongs to the host process rather than to a client, and
+#| a host that wired a callback up is listening from that moment on, so an
+#| in-process server with no transport at all still delivers.  It takes a
+#| notification a client channel could not (a modern request with no sink, a
+#| legacy session that has not finished its handshake, a server nobody has
+#| dialled into), and out of a request it is delivered to B<as well as> the
+#| shared transport rather than instead of it — the host and a connected client
+#| are two audiences, not two attempts at one.  Inside a request the request's
+#| own channel still wins outright, so a notification is never delivered twice
+#| to the same host.
 #|
 #| Two things C<log> does that this does not: it echoes to C<$*ERR>, and it
 #| applies the level gating (C<logging/setLevel> for legacy, C<_meta> C<logLevel>
@@ -946,17 +1184,72 @@ method notify(%notif --> Bool:D) {
 	# Modern notifications are request-scoped by definition: with no sink on the
 	# context there is no channel this one could legitimately travel on, and the
 	# transport-wide fallback below would leak it into another request's stream.
-	return $ctx.emit-notification(%notif) if $ctx.defined && $ctx.era eq 'modern';
+	# The in-process sink is not one of those channels -- nothing about it can
+	# surface in another request's stream -- so it is still allowed to have it.
+	if $ctx.defined && $ctx.era eq 'modern' {
+		return True if $ctx.emit-notification(%notif);
+		return self!emit-in-process(%notif);
+	}
 
-	return False unless $!initialized;
-	return True if $ctx.defined && $ctx.emit-notification(%notif);
+	# The request's own sink, still behind the handshake gate: it is the client's
+	# channel, and the legacy rules say the client hears nothing until it has
+	# said it is listening.
+	return True if $!initialized && $ctx.defined && $ctx.emit-notification(%notif);
 
 	# Out of a request (or in one whose context has no sink of its own) legacy
 	# notifications go to the shared transport, which is where they belong: a
-	# legacy session only ever has one client on it.
-	return False unless $!transport.defined;
+	# legacy session only ever has one client on it -- and to the host's own
+	# in-process sink, which is a different audience rather than a fallback for
+	# this one.  The gate does not apply to the host: it never shook hands,
+	# because there was never a handshake to have.
+	my Bool:D $took = self!emit-in-process(%notif);
+
+	return $took unless $!initialized && $!transport.defined;
 	$!transport.write-message(format-message(%notif));
 	True;
+}
+
+# Hand a notification to the host's in-process sink, and say whether there was
+# one.  Shielded: the sink runs on whatever thread raised the notification --
+# a job flusher, typically, whose next act would otherwise be to die with the
+# job's remaining output still unpushed -- and a host callback that throws is
+# the host's bug, not a reason to unwind somebody else's stack.
+#
+# A throw still counts as delivered.  The alternative is to answer False and
+# let the caller fall back to a client channel, which would put the host's
+# broken sink and the client's working one in a race for the same message.
+method !emit-in-process(%notif --> Bool:D) {
+	return False unless &!on-notify.defined;
+
+	my $failure;
+	{
+		CATCH { default { $failure = $_ } }
+		&!on-notify(%notif);
+	}
+	self!warn-notify-sink($failure) with $failure;
+	True;
+}
+
+# Reported straight to $*ERR rather than through .log: log raises a
+# notifications/message, which would come back through notify into the sink
+# that has just thrown.  Once per server, for the same reason.
+method !warn-notify-sink($failure --> Nil) {
+	my Bool:D $first = $!notify-sink-lock.protect: {
+		my $was = $!notify-sink-warned;
+		$!notify-sink-warned = True;
+		!$was;
+	};
+	return unless $first;
+
+	my $why = $failure.?message // ~$failure;
+	$log-lock.protect: {
+		$*ERR.say(
+			"[MCP/error] MCP server '$!name': the :on-notify sink threw "
+			~ "({$why.lines.head // ''}); that notification is lost and further "
+			~ 'sink failures will not be reported',
+		);
+	};
+	Nil;
 }
 
 # === Internal handlers ===

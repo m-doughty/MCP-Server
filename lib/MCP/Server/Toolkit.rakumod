@@ -8,6 +8,13 @@ unit role MCP::Server::Toolkit;
 #| Register everything this toolkit provides on the supplied registrar.
 #| The registrar quacks like MCP::Server — .tool, .prompt and .resource — but
 #| applies the plug-time prefix to every name it is given.
+#|
+#| Annotate the tools that only read: C<< .tool: 'read', annotations => {
+#| readOnlyHint => True, idempotentHint => True }, ... >>.  A host reads those
+#| two together as a licence to run a batch of such calls at once and to
+#| execute identical ones once, so declare them only where they are true of
+#| the HANDLER — two of it will be running at the same time.  See MCP::Server's
+#| "Writing a tool pack" for the whole of the contract.
 method register($registrar) { ... }
 
 #| Prefix applied when .plug is called without an explicit :prefix.

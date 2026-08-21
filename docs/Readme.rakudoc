@@ -305,12 +305,53 @@ format, sorted by name so the declarations a prompt carries are stable
 between runs. C<execute-tool-calls> routes the LLM's tool call requests to
 your registered handlers and returns results ready to send back. Tool
 results include C<role>, C<tool_call_id>, C<content>, and C<is_error>.
+When a handler returns a protocol result with C<structuredContent>, the bridge
+also preserves it as C<structured_content>; the model-visible C<content> is
+rendered independently and is unchanged. This is the same key and rendering
+used by C<MCP::Client>'s remote bridge.
 
 Each call's C<arguments> may be a hash or the JSON string most APIs
 actually send; an empty or blank string means "no arguments", which is
 what models send for a tool that takes none. Anything else that is not a
 JSON object comes back as a result with C<is_error> set, never as an
 exception.
+
+C<tools-for-llm> deliberately carries B<no annotations>: these
+declarations go on an OpenAI-compatible provider's wire verbatim, where
+an unrecognised member of a tool declaration is a 400 rather than an
+ignored field. Annotations are published where the protocol puts them —
+the C<tools/list> catalog — and read back through
+C<< $server.tool-annotations($name) >>.
+
+=head3 How a batch is executed
+
+C<execute-tool-calls> runs the calls it is given B<serially, in model
+order> — unless B<every> call in the batch names a tool annotated
+C<readOnlyHint> and C<idempotentHint>, in which case the distinct calls
+run on up to C<$.tool-concurrency> workers (default 4). Three things hold
+either way:
+
+=item B<Order is not an outcome.> Result I<n> answers call I<n>, whatever
+finished first, each under the C<tool_call_id> of the call it answers.
+=item B<One mutating call makes the batch a sequence.> A write, a command
+or a question for the user beside a read means the read waits its turn: a
+model that asked for both in one turn is describing an order, and the
+annotation is the only evidence there is that a call is not part of one.
+=item B<Identical calls in a widened batch execute once>, the answer
+copied into each slot that asked for it. Two reads of one file is one
+read — one file opened, one lot of tokens back.
+
+=begin code :lang<raku>
+# Four annotated reads: up to four handlers at once, answers in order.
+my @results = $server.execute-tool-calls(@four-reads);
+
+# Never widen anything, whatever is annotated:
+my $strict = MCP::Server.new(:name<strict>, tool-concurrency => 1);
+=end code
+
+C<MCP::Client>'s bridge does exactly the same with what a remote server
+annotated, so a toolkit is interchangeable local or remote in this too.
+See L<MCP::Server::Batch> for the scheduler both of them share.
 
 =head2 Resources
 
@@ -578,11 +619,60 @@ server that happens to embed it — a well-behaved pack works equally as a
 one-shot C<:tools> entry, a C<.plug>-ed instance, or a config-file entry
 in any host server.
 
+=item Annotate the tools that only read — see below. It is the one piece
+of self-description a host can act on, and the pack is the only thing
+that knows the answer.
+
 Two reference packs ship as separate distributions and are worth reading
 as examples of the conventions above:
 
 =item C<MCP::Server::Tool::FileSystem> — root-confined file access.
 =item C<MCP::Server::Tool::Shell> — allowlisted command runner.
+
+=head3 Annotations
+
+Every registration takes an optional C<:%annotations>, the MCP
+C<Tool.annotations> object. It is published in the C<tools/list> catalog
+exactly as given, and it is what tells a host what calling the tool does:
+
+=begin code :lang<raku>
+$registrar.tool: 'read',
+    annotations => { readOnlyHint => True, idempotentHint => True },
+    description => 'Read a file from inside the server root',
+    params  => { path => { type => 'string', required => True } },
+    handler => -> :%args { ... };
+=end code
+
+The spec's keys are C<readOnlyHint>, C<destructiveHint>,
+C<idempotentHint> and C<openWorldHint> (each a C<Bool>) plus a
+human-facing C<title> (a C<Str>). Those five are type-checked at
+registration, because a C<< readOnlyHint => 'true' >> is a hint that
+reads as set and tests as unset everywhere it matters; any other key
+travels untouched, since the annotations object is open. A tool that
+declares nothing publishes no C<annotations> member at all.
+
+B<What this server does with them.> C<readOnlyHint> and C<idempotentHint>
+together — B<both>, explicitly C<True> — are a licence for
+C<execute-tool-calls> to run a batch of such calls side by side and to
+execute identical calls in that batch once (see "LLM Tool Bridge" below).
+Nothing else here reads them; they are otherwise the pack's word to
+whichever client is listening.
+
+B<So annotate honestly, and remember what the claim is about.> It is
+about the B<handler>, not the intent:
+
+=item B<Read-only> means the call changes nothing a later call could
+observe — not on this machine, not on a remote one.
+=item B<Idempotent> means calling it again with the same arguments adds
+nothing. A tool that hands out a fresh handle, or asks a human a
+question, is not idempotent however little it writes.
+=item B<Both together mean thread-safe against itself.> Two of them will
+be inside your handler at once. Anything they share — a memoised cache, a
+lazily-built client, a counter — needs a lock, and a lazy initialiser two
+callers can enter is the classic way to find that out the hard way.
+
+Anything you would not want run twice at once carries nothing. That is
+the safe direction, and it costs only the width of one batch.
 
 =head2 Examples
 
@@ -902,7 +992,9 @@ to say" looks like for them (C<202> over HTTP).
 =item C<:&notify> is called B<synchronously, on the calling thread>, zero
 or more times, before the method returns. That is what lets a live
 stream carry a handler's log lines as they happen rather than after the
-fact. Leave it out and the request's notifications are dropped.
+fact. Leave it out and the request's notifications are dropped — unless
+the server carries an C<:&on-notify> sink, which picks up what the
+request had nowhere to put (see "The host as the client" below).
 =item C<:$cancelled> is a Promise the transport keeps for "the caller has
 walked away". It reaches handlers through
 C<$*MCP-REQUEST-CONTEXT.cancelled>.
@@ -1011,13 +1103,65 @@ It is safe to call from any thread — the bundled transports serialise
 their writes — which is what makes it usable from a C<Supply.interval>
 flusher or a worker that outlives the request that started it. A modern
 request's notification still goes to that request's channel and nowhere
-else; out of a request the legacy rules apply, so nothing is sent before
-the client has said it is initialized.
+else; out of a request the legacy rules apply, so nothing is sent to a
+client before it has said it is initialized.
+
+=head3 The host as the client
+
+None of those channels exists in a server nobody dials into — one built
+to be driven through C<execute-tool-calls> or C<handle-request> from the
+process that created it. Its toolkits still raise notifications, and a
+background job announcing that it has finished is worth hearing.
+C<:&on-notify> is where they go:
+
+=begin code :lang<raku>
+my $events = Channel.new;
+
+my $server = MCP::Server.new(
+    :name<in-process>,
+    on-notify => -> %notification { $events.send(%notification) },
+);
+$server.plug: MCP::Server::Tool::Shell.new(allow => <make>);
+
+# ... later, on the host's own thread:
+react whenever $events -> %notification {
+    next unless %notification<method> eq 'notifications/job';
+    say "job {%notification<params><job>} is {%notification<params><state>}";
+}
+=end code
+
+The sink is called with the same C<< { method => ..., params => ... } >>
+hash a transport would have written, and B<the contract is narrow on
+purpose>:
+
+=item B<Leaf.> It must not call back into the server, and least of all
+into C<log> or C<notify> — a sink that logs is a sink that notifies
+itself.
+=item B<Non-blocking.> Hand the notification to a queue and return, as
+the C<Channel> above does.
+=item B<Thread-agnostic.> It is called on whatever thread raised the
+notification: a handler thread, a C<Promise> watcher, a job flusher.
+Those flushers are a small shared pool, so a sink that blocks for a
+second stalls every job's output in the process for a second.
+=item B<Shielded, not forgiven.> A throw is caught — it cannot take down
+the job flusher that called it — and the notification counts as
+delivered. The failure is reported once on C<$*ERR> and that
+notification is gone. Do your own error handling inside the sink.
+
+Where it sits in the routing: last, and outside the handshake gate. A
+request with a channel of its own still wins outright, so nothing is
+delivered twice; a modern request with no sink, a legacy session that
+has not finished its handshake, and a server with no transport at all
+all reach the sink instead of dropping. Out of a request it is delivered
+to B<as well as> a connected transport, because the host and the client
+are two audiences rather than two attempts at one.
 
 The bridge is the one exception to "outside a request": a tool called
-through C<execute-tool-calls> gets a legacy-era context with no
-notification sink, so a handler that reads the context works there too
-rather than dying on an undefined dynamic variable.
+through C<execute-tool-calls> gets a legacy-era context, so a handler
+that reads the context works there too rather than dying on an undefined
+dynamic variable. Its notification sink is the C<:&on-notify> callback
+when there is one and nothing at all when there is not, which is what
+C<$ctx.emit-notification> reports back either way.
 
 =head3 Progress
 

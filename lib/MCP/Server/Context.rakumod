@@ -40,9 +40,11 @@ has %.client-capabilities;
 # it came in.
 has $!progress-token;
 
-#| Notification sink for this request.  Undefined means notifications are
-#| dropped, which is what a bare handle-request with no transport has always
-#| done.
+#| Notification sink for this request.  Undefined means this request has no
+#| channel of its own, which is what a bare handle-request with no transport has
+#| always had; C<MCP::Server.notify> then falls back to whatever the server has
+#| (an C<:on-notify> sink, a legacy transport), and drops the notification when
+#| it has nothing either.
 has &.emit;
 
 #| The elicitation rendezvous for this call, when the dispatcher parked it for
