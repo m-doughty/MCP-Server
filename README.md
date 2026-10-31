@@ -54,7 +54,7 @@ $server.tool: 'search',
     };
 ```
 
-A parameter spec may carry four keys, and each one reaches the published schema:
+A parameter spec supports these schema declarations:
 
   * `type` — the JSON Schema type; `string` when the spec omits it.
 
@@ -63,6 +63,16 @@ A parameter spec may carry four keys, and each one reaches the published schema:
   * `required` — `True` names the parameter in the schema's top-level `required` array. Leave it off and the model is told the parameter is optional, so mark every parameter the handler cannot do without: the schema is the only place a model can learn that before it calls.
 
   * `default` — emitted as the JSON Schema `default` keyword, so a model can see what omitting the argument actually means.
+
+  * `items` — the item schema for an array parameter, including nested schemas.
+
+  * `enum` — the allowed values for a parameter.
+
+  * `minimum` and `maximum` — the bounds for a numeric parameter.
+
+  * `minItems` and `maxItems` — the length bounds for an array parameter.
+
+These six constraint keys are copied whenever present, including zero bounds and empty enums. Nested item schemas are copied unchanged. Other parameter-spec keys are ignored. These declarations do not validate arguments; the handler remains responsible for validation.
 
 Declaring a default does not *apply* one: nothing in the framework fills a missing argument in, and the handler still decides what an absent argument means. So the declared value must be the one the handler itself uses — a schema advertising a default the code does not honour is worse than no default at all. The key is copied whenever it is present, never when it is merely true, so `default => False ` and `default => 0 ` are published like any other value:
 

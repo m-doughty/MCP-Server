@@ -2,6 +2,13 @@ Revision history for MCP::Server
 
 {{$NEXT}}
 
+0.7.2  2026-10-31T16:17:45Z
+    - CHANGE: [2026-10-31] Tool input schemas now publish declared `items`,
+      `enum`, `minimum`, `maximum`, `minItems` and `maxItems` constraints.
+      Zero bounds, empty enums and nested item schemas are preserved.
+      Other parameter-spec keys remain ignored. Argument validation
+      remains the handler's responsibility.
+
 0.7.1  2026-10-05T10:45:10+01:00
 
     - CHANGE: [2026-09-28] Requires JSON::Fast 0.21.0 or later (zef:timo).

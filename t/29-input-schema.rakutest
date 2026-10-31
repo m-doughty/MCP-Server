@@ -10,7 +10,7 @@ use MCP::Server::Tool;
 # the property.  Both are declaration — nothing here enforces or applies them —
 # so these tests are about what reaches the wire, not about handler behaviour.
 
-plan 7;
+plan 12;
 
 subtest 'required and default reach the schema' => {
 	plan 6;
@@ -141,30 +141,156 @@ subtest 'schema shape is untouched otherwise' => {
 	is %schema<properties><a><type>, 'string', 'an absent type still defaults to string';
 	is %schema<properties><a><description>, 'No type given', 'description still copied';
 	is-deeply %schema<properties><a>.keys.sort.List, <default description type>.List,
-		'and nothing else from the spec leaks into the property';
+		'and the property carries exactly the keys the spec declared';
 };
 
-subtest 'unknown spec keys are still dropped' => {
-	plan 1;
+subtest 'declared item types, enums and bounds reach the property' => {
+	plan 9;
 
-	# This task published `default` and nothing else: `items`, `enum` and the
-	# numeric bounds are deliberately not carried yet, and a test that says so
-	# is what stops the next one arriving by accident.
 	my $tool = MCP::Server::Tool.new(
 		name => 'extras',
 		params => {
-			a => {
-				type    => 'array',
-				default => [],
-				items   => { type => 'string' },
-				enum    => <x y>.Array,
-				minimum => 1,
+			args => {
+				type     => 'array',
+				default  => [],
+				items    => { type => 'string' },
+				minItems => 1,
+				maxItems => 3,
 			},
+			mode => { type => 'string', enum => ['fast', 'safe'] },
+			limit => { type => 'number', minimum => -1.5, maximum => 10.5 },
 		},
 		handler => -> :%args { 'ok' },
 	);
-	is-deeply $tool.input-schema<properties><a>.keys.sort.List, <default type>.List,
-		'only type and default survive';
+	my %props = $tool.input-schema<properties>;
+	is-deeply %props<args><items>, { type => 'string' }, 'items reaches the property';
+	is-deeply %props<mode><enum>, ['fast', 'safe'], 'enum reaches the property';
+	is %props<limit><minimum>, -1.5, 'a negative minimum reaches the property';
+	is %props<limit><maximum>, 10.5, 'a fractional maximum reaches the property';
+	is %props<args><minItems>, 1, 'minItems reaches the property';
+	is %props<args><maxItems>, 3, 'maxItems reaches the property';
+	is-deeply %props<args>.keys.sort.List,
+		<default items maxItems minItems type>.List,
+		'the array property carries exactly its declared schema keys';
+
+	# The schema is built fresh from the params on every call: two reads
+	# publish equal structures, and neither is the other's own hash.
+	my %first  = $tool.input-schema<properties>;
+	my %second = $tool.input-schema<properties>;
+	is-deeply %first, %second, 'two reads publish equal properties';
+	nok (%first<args> =:= %props<args>), 'and each read builds its own property hash';
+};
+
+subtest 'falsy constraints are published without inventing absent keys' => {
+	plan 12;
+
+	my $tool = MCP::Server::Tool.new(
+		name => 'falsy-constraints',
+		params => {
+			args => { type => 'array', items => False, minItems => 0, maxItems => 0 },
+			mode => { type => 'string', enum => [] },
+			limit => { type => 'number', minimum => 0, maximum => 0 },
+			plain => { type => 'string' },
+		},
+		handler => -> :%args { 'ok' },
+	);
+	my %props = from-json(to-json($tool.input-schema))<properties>;
+	is-deeply %props<args><items>, False, 'a false item schema survives JSON';
+	is-deeply %props<mode><enum>, [], 'an empty enum survives JSON';
+	is %props<limit><minimum>, 0, 'a zero minimum is published';
+	is %props<limit><maximum>, 0, 'a zero maximum is published';
+	is %props<args><minItems>, 0, 'a zero minItems is published';
+	is %props<args><maxItems>, 0, 'a zero maxItems is published';
+	for <items enum minimum maximum minItems maxItems> -> $key {
+		nok %props<plain>{$key}:exists, "an absent $key is not invented";
+	}
+};
+
+subtest 'explicit null constraints remain present' => {
+	plan 12;
+
+	my $tool = MCP::Server::Tool.new(
+		name => 'null-constraints',
+		params => { value => {
+			items => Nil, enum => Nil, minimum => Nil, maximum => Nil,
+			minItems => Nil, maxItems => Nil,
+		} },
+		handler => -> :%args { 'ok' },
+	);
+	my %prop = from-json(to-json($tool.input-schema))<properties><value>;
+	for <items enum minimum maximum minItems maxItems> -> $key {
+		ok %prop{$key}:exists, "an explicit null $key stays present";
+		nok %prop{$key}.defined, "and its value remains null";
+	}
+};
+
+subtest 'unrelated spec keys are not published' => {
+	plan 2;
+
+	my $tool = MCP::Server::Tool.new(
+		name => 'unsupported',
+		params => { value => {
+			type => 'object', required => True,
+			additionalProperties => False, properties => { name => { type => 'string' } },
+			pattern => 'example', examples => ['example'], custom => 'private',
+		} },
+		handler => -> :%args { 'ok' },
+	);
+	my %schema = $tool.input-schema;
+	is-deeply %schema<properties><value>, { type => 'object' },
+		'only supported property keys reach the schema';
+	is-deeply %schema<required>, ['value'],
+		'required names the parameter without becoming a property keyword';
+};
+
+subtest 'legacy schemas stay byte-identical with undefined values' => {
+	plan 2;
+
+	my $tool = MCP::Server::Tool.new(
+		name => 'legacy',
+		params => {
+			plain => {},
+			nullable => { type => Nil, description => Nil, default => Nil, required => True },
+			flag => { type => 'boolean', description => '', default => False },
+		},
+		handler => -> :%args { 'ok' },
+	);
+	my %expected = type => 'object', properties => {
+		plain => { type => 'string' },
+		nullable => { type => 'string', default => Any },
+		flag => { type => 'boolean', description => '', default => False },
+	}, required => ['nullable'];
+	my %schema = $tool.input-schema;
+	is-deeply %schema, %expected,
+		'an undefined type still defaults, an undefined description stays absent';
+	is to-json(%schema, :!pretty, :sorted-keys),
+		to-json(%expected, :!pretty, :sorted-keys),
+		'the legacy schema has the same JSON bytes';
+};
+
+subtest 'nested items survive both catalogs and JSON encoding' => {
+	plan 4;
+
+	my %items = type => 'object', properties => {
+		name => { type => 'string' },
+		choices => { type => 'array', items => { type => 'string', enum => ['a', 'b'] } },
+	}, required => ['name'], additionalProperties => False;
+	my $server = MCP::Server.new(:name<items-test>, :version<1.0>);
+	$server.tool: 'questions',
+		params => { questions => { type => 'array', items => %items, required => True } },
+		handler => -> :%args { 'ok' };
+
+	my %resp = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	my %schema = %resp<result><tools>[0]<inputSchema>;
+	is-deeply %schema<properties><questions><items>, %items,
+		'items retains nested properties, required and additionalProperties';
+	is-deeply %schema<required>, ['questions'], 'the parameter stays required';
+	my %wire = from-json(to-json(%resp))<result><tools>[0]<inputSchema>;
+	is-deeply %wire, %schema, 'the entire nested schema survives tools/list JSON';
+	my %llm = from-json(to-json($server.tools-for-llm))[0]<function><parameters>;
+	is-deeply %llm, %schema, 'tools-for-llm publishes the same nested schema';
 };
 
 subtest 'defaults survive the wire' => {

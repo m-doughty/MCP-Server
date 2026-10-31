@@ -55,8 +55,7 @@ $server.tool: 'search',
     };
 =end code
 
-A parameter spec may carry four keys, and each one reaches the published
-schema:
+A parameter spec supports these schema declarations:
 
 =item C<type> — the JSON Schema type; C<string> when the spec omits it.
 =item C<description> — what the parameter means, written for the model.
@@ -66,6 +65,15 @@ optional, so mark every parameter the handler cannot do without: the
 schema is the only place a model can learn that before it calls.
 =item C<default> — emitted as the JSON Schema C<default> keyword, so a
 model can see what omitting the argument actually means.
+=item C<items> — the item schema for an array parameter, including nested schemas.
+=item C<enum> — the allowed values for a parameter.
+=item C<minimum> and C<maximum> — the bounds for a numeric parameter.
+=item C<minItems> and C<maxItems> — the length bounds for an array parameter.
+
+These six constraint keys are copied whenever present, including zero
+bounds and empty enums. Nested item schemas are copied unchanged.
+Other parameter-spec keys are ignored. These declarations do not validate
+arguments; the handler remains responsible for validation.
 
 Declaring a default does not I<apply> one: nothing in the framework fills
 a missing argument in, and the handler still decides what an absent
