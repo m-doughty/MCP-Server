@@ -1155,7 +1155,7 @@ Calling a `slow-count` tool that logs `"step $_"` as it goes, with both conditio
 
     $ curl -sN http://127.0.0.1:8080/mcp \
         -H 'Content-Type: application/json' \
-        -H 'Accept: text/event-stream' \
+        -H 'Accept: application/json, text/event-stream' \
         -H 'MCP-Protocol-Version: 2026-07-28' \
         -H 'Mcp-Method: tools/call' -H 'Mcp-Name: slow-count' \
         -d '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
